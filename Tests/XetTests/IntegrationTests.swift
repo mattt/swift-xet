@@ -111,7 +111,7 @@ struct IntegrationTests {
 
         let range: Range<UInt64> = 0 ..< (256 * 1024)
         let bytesWritten = try await downloader.download(
-            for: fileID,
+            fileID,
             byteRange: range,
             to: destinationURL
         )

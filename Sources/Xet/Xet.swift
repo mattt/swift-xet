@@ -24,7 +24,7 @@ import Foundation
 /// Download a file to disk:
 ///
 /// ```swift
-/// try await downloader.download(for: fileID, to: destinationURL)
+/// try await downloader.download(fileID, to: destinationURL)
 /// ```
 ///
 /// Both methods support partial downloads via the `byteRange` parameter.
@@ -87,7 +87,7 @@ public struct XetDownloader: Sendable {
     ///   or `URLError` for network failures.
     ///
     /// - Important: This method loads the entire file (or range) into memory.
-    ///   For large files, use ``download(for:byteRange:to:)``
+    ///   For large files, use ``download(_:byteRange:to:)``
     ///   to write directly to disk instead.
     public func data(
         for fileID: String,
@@ -126,7 +126,7 @@ public struct XetDownloader: Sendable {
     ///   or file system errors if writing to disk fails.
     @discardableResult
     public func download(
-        for fileID: String,
+        _ fileID: String,
         byteRange: Range<UInt64>? = nil,
         to destinationURL: URL
     ) async throws -> Int64 {
