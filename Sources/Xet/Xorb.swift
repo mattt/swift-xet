@@ -9,12 +9,12 @@ import Foundation
 ///
 /// ## Chunk Header Format
 ///
-/// | Bytes | Field | Description |
-/// |-------|-------|-------------|
-/// | 0 | Version | Protocol version (currently 0) |
-/// | 1-3 | Compressed Size | Little-endian 24-bit integer |
-/// | 4 | Compression Type | 0=none, 1=LZ4, 2=BG4+LZ4 |
-/// | 5-7 | Uncompressed Size | Little-endian 24-bit integer |
+/// | Bytes |         Field        |              Description                 |
+/// |------:|:---------------------|:-----------------------------------------|
+/// |   0   | Version              | Protocol version (currently 0)           |
+/// | 1-3   | Compressed Size      | Little-endian 24-bit integer             |
+/// |   4   | Compression Type     | 0=none, 1=LZ4, 2=BG4+LZ4                 |
+/// | 5-7   | Uncompressed Size    | Little-endian 24-bit integer             |
 ///
 /// ## Usage
 ///
