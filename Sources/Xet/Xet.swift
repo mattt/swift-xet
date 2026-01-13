@@ -116,6 +116,8 @@ public struct XetDownloader: Sendable {
     ///     making any network requests.
     ///   - destinationURL: The file URL where contents will be written.
     ///     If a file exists at this path, it will be replaced.
+    ///   - fileManager: The file manager to use for file operations.
+    ///     Defaults to `.default`.
     ///
     /// - Returns: The number of bytes written.
     ///
@@ -128,14 +130,15 @@ public struct XetDownloader: Sendable {
     public func download(
         _ fileID: String,
         byteRange: Range<UInt64>? = nil,
-        to destinationURL: URL
+        to destinationURL: URL,
+        fileManager: FileManager = .default
     ) async throws -> Int64 {
+        if fileManager.fileExists(atPath: destinationURL.path) {
+            try fileManager.removeItem(at: destinationURL)
+        }
+        fileManager.createFile(atPath: destinationURL.path, contents: nil)
+
         if let byteRange, byteRange.isEmpty {
-            let fm = FileManager.default
-            if fm.fileExists(atPath: destinationURL.path) {
-                try fm.removeItem(at: destinationURL)
-            }
-            fm.createFile(atPath: destinationURL.path, contents: nil)
             return 0
         }
         let writer = try FileOutputWriter(destinationURL: destinationURL)
@@ -553,11 +556,6 @@ actor FileOutputWriter: OutputWriter {
     private let handle: FileHandle
 
     init(destinationURL: URL) throws {
-        let fm = FileManager.default
-        if fm.fileExists(atPath: destinationURL.path) {
-            try fm.removeItem(at: destinationURL)
-        }
-        fm.createFile(atPath: destinationURL.path, contents: nil)
         self.handle = try FileHandle(forWritingTo: destinationURL)
     }
 
