@@ -49,6 +49,7 @@ Then add the dependency to your target:
 ### Downloading a File
 
 To download a file, you need:
+
 - A **file ID**: the 64-character hex hash from the `X-Xet-Hash` response header
 - A **refresh URL**: the Hub endpoint for obtaining CAS access tokens
 
@@ -64,7 +65,7 @@ let downloader = XetDownloader(
 let data = try await downloader.data(for: fileID)
 
 // Download to disk
-try await downloader.download(for: fileID, to: destinationURL)
+try await downloader.download(fileID, to: destinationURL)
 ```
 
 ### Partial Downloads
@@ -113,8 +114,9 @@ The Xet protocol reconstructs files from deduplicated, compressed chunks:
 
 ### Xorb Format
 
-Files are stored as *xorbs* (Xet Orbs)—sequences of compressed chunks.
+Files are stored as _xorbs_ (Xet Orbs)—sequences of compressed chunks.
 Each chunk has an 8-byte header specifying:
+
 - Version (1 byte)
 - Compressed size (3 bytes, little-endian)
 - Compression scheme (1 byte): none, LZ4, or BG4+LZ4
