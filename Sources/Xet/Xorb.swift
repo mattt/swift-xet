@@ -72,16 +72,22 @@ public enum Xorb {
     /// - Throws: ``XorbError`` if the header is invalid.
     static func parseHeader(_ bytes: Data) throws -> Header {
         guard bytes.count == 8 else { throw XorbError.invalidLength }
+        return try bytes.withUnsafeBytes { raw in
+            try parseHeader(raw)
+        }
+    }
 
-        let b = [UInt8](bytes)
-        let version = b[0]
+    static func parseHeader(_ bytes: UnsafeRawBufferPointer) throws -> Header {
+        guard bytes.count >= 8 else { throw XorbError.invalidLength }
+
+        let version = bytes[0]
         if version != 0 {
             throw XorbError.unsupportedVersion(version)
         }
 
-        let compressedLength = Int(b[1]) | (Int(b[2]) << 8) | (Int(b[3]) << 16)
-        let schemeRaw = b[4]
-        let uncompressedLength = Int(b[5]) | (Int(b[6]) << 8) | (Int(b[7]) << 16)
+        let compressedLength = Int(bytes[1]) | (Int(bytes[2]) << 8) | (Int(bytes[3]) << 16)
+        let schemeRaw = bytes[4]
+        let uncompressedLength = Int(bytes[5]) | (Int(bytes[6]) << 8) | (Int(bytes[7]) << 16)
 
         guard let scheme = CompressionScheme(rawValue: schemeRaw) else {
             throw XorbError.unsupportedCompressionScheme(schemeRaw)
@@ -136,6 +142,63 @@ public enum Xorb {
             return BG4.regroup(decompressed)
         }
     }
+
+    static func decodePayload(compressed: UnsafeRawBufferPointer, header: Header) throws -> Data {
+        switch header.compressionScheme {
+        case .none:
+            guard compressed.count == header.uncompressedLength else {
+                throw XorbError.lengthMismatch(
+                    expected: header.uncompressedLength,
+                    actual: compressed.count
+                )
+            }
+            if compressed.count == 0 {
+                return Data()
+            }
+            return Data(bytes: compressed.baseAddress!, count: compressed.count)
+
+        case .lz4:
+            do {
+                return try LZ4.decompressBlock(
+                    compressed,
+                    uncompressedLength: header.uncompressedLength
+                )
+            } catch {
+                throw XorbError.decompressionFailed
+            }
+
+        case .byteGrouping4LZ4:
+            let decompressed: Data
+            do {
+                decompressed = try LZ4.decompressBlock(
+                    compressed,
+                    uncompressedLength: header.uncompressedLength
+                )
+            } catch {
+                throw XorbError.decompressionFailed
+            }
+            return BG4.regroup(decompressed)
+        }
+    }
+
+    static func decodeNextChunk(from cursor: inout ByteCursor) throws -> Data? {
+        var consumeCount = 0
+        let chunk = try cursor.withUnsafeReadableBytes { raw -> Data? in
+            guard raw.count >= 8 else { return nil }
+            let header = try parseHeader(raw)
+            let totalLength = 8 + header.compressedLength
+            guard raw.count >= totalLength else { return nil }
+            guard let base = raw.baseAddress else { return nil }
+            let payloadStart = base.advanced(by: 8)
+            let payload = UnsafeRawBufferPointer(start: payloadStart, count: header.compressedLength)
+            consumeCount = totalLength
+            return try decodePayload(compressed: payload, header: header)
+        }
+        if chunk != nil {
+            cursor.consume(count: consumeCount)
+        }
+        return chunk
+    }
 }
 
 // MARK: - Xorb.ChunkSequence
@@ -167,21 +230,10 @@ extension Xorb {
             /// Returns the next uncompressed chunk, or `nil` at end of stream.
             public mutating func next() async throws -> Data? {
                 while true {
-                    if let headerBytes = cursor.peek(count: 8) {
-                        let header = try Xorb.parseHeader(headerBytes)
-                        if cursor.count >= 8 + header.compressedLength {
-                            _ = cursor.take(count: 8)
-                            guard let compressed = cursor.take(count: header.compressedLength) else {
-                                throw XorbError.truncatedStream
-                            }
-                            return try Xorb.decodePayload(
-                                compressed: compressed,
-                                header: header
-                            )
-                        } else if reachedEOF {
-                            throw XorbError.truncatedStream
-                        }
-                    } else if reachedEOF {
+                    if let chunk = try Xorb.decodeNextChunk(from: &cursor) {
+                        return chunk
+                    }
+                    if reachedEOF {
                         if cursor.count == 0 {
                             return nil
                         }
@@ -226,21 +278,10 @@ extension Xorb {
 
             public mutating func next() async throws -> Data? {
                 while true {
-                    if let headerBytes = cursor.peek(count: 8) {
-                        let header = try Xorb.parseHeader(headerBytes)
-                        if cursor.count >= 8 + header.compressedLength {
-                            _ = cursor.take(count: 8)
-                            guard let compressed = cursor.take(count: header.compressedLength) else {
-                                throw XorbError.truncatedStream
-                            }
-                            return try Xorb.decodePayload(
-                                compressed: compressed,
-                                header: header
-                            )
-                        } else if reachedEOF {
-                            throw XorbError.truncatedStream
-                        }
-                    } else if reachedEOF {
+                    if let chunk = try Xorb.decodeNextChunk(from: &cursor) {
+                        return chunk
+                    }
+                    if reachedEOF {
                         if cursor.count == 0 {
                             return nil
                         }
@@ -313,6 +354,16 @@ struct ByteCursor {
     /// The number of unread bytes in the buffer.
     var count: Int { buffer.count - startIndex }
 
+    /// Provides unsafe access to the unread portion of the buffer.
+    func withUnsafeReadableBytes<T>(_ body: (UnsafeRawBufferPointer) throws -> T) rethrows -> T {
+        try buffer.withUnsafeBytes { raw in
+            let readableCount = max(0, raw.count - startIndex)
+            let start = raw.baseAddress?.advanced(by: startIndex)
+            let readable = UnsafeRawBufferPointer(start: start, count: readableCount)
+            return try body(readable)
+        }
+    }
+
     /// Appends data to the buffer.
     mutating func append(_ data: Data) {
         buffer.append(data)
@@ -321,6 +372,12 @@ struct ByteCursor {
     /// Appends bytes to the buffer.
     mutating func append<S: Sequence>(_ bytes: S) where S.Element == UInt8 {
         buffer.append(contentsOf: bytes)
+    }
+
+    /// Appends raw bytes to the buffer.
+    mutating func append(_ bytes: UnsafeRawBufferPointer) {
+        let typed = bytes.bindMemory(to: UInt8.self)
+        buffer.append(contentsOf: typed)
     }
 
     /// Appends a single byte to the buffer.
@@ -355,9 +412,14 @@ struct ByteCursor {
     /// - Returns: `true` if skipped, `false` if insufficient bytes available.
     mutating func skip(count n: Int) -> Bool {
         guard count >= n else { return false }
+        consume(count: n)
+        return true
+    }
+
+    /// Consumes the next `n` bytes.
+    mutating func consume(count n: Int) {
         startIndex += n
         compactIfNeeded()
-        return true
     }
 
     /// Removes consumed bytes when the prefix is large enough to warrant it.

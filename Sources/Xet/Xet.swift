@@ -45,6 +45,7 @@ public struct XetDownloader: Sendable {
     private let httpClientRequestTimeout: TimeAmount
     private let maxConcurrentWrites: Int
     private let maxConcurrentDecodes: Int
+    private let maxInflightBuffers: Int
 
     /// Whether to allow insecure (non-HTTPS) connections.
     ///
@@ -61,6 +62,7 @@ public struct XetDownloader: Sendable {
         public var maxConcurrentFetches: Int = 64
         public var maxConcurrentDecodes: Int = Configuration.recommendedDecodeConcurrency
         public var maxConcurrentWrites: Int = 64
+        public var maxInflightBuffers: Int = 8
         public var connectionsPerHost: Int = 32
         public var prewarmedConnections: Int = 8
         public var poolSize: Int = 2
@@ -82,6 +84,7 @@ public struct XetDownloader: Sendable {
             config.maxConcurrentFetches = 512
             config.maxConcurrentDecodes = Configuration.recommendedDecodeConcurrency
             config.maxConcurrentWrites = 512
+            config.maxInflightBuffers = 16
             config.connectionsPerHost = 256
             config.prewarmedConnections = 64
             config.poolSize = 6
@@ -135,6 +138,7 @@ public struct XetDownloader: Sendable {
         self.httpClientRequestTimeout = .seconds(Int64(max(1, configuration.readTimeout)))
         self.maxConcurrentWrites = max(1, configuration.maxConcurrentWrites)
         self.maxConcurrentDecodes = max(1, configuration.maxConcurrentDecodes)
+        self.maxInflightBuffers = max(1, configuration.maxInflightBuffers)
     }
 
     private func logDebug(_ message: @autoclosure () -> String) {
@@ -284,6 +288,7 @@ public struct XetDownloader: Sendable {
 
         var termContexts: [TermContext] = []
         termContexts.reserveCapacity(reconstruction.terms.count)
+        var expectedUnpackedBytesByKey: [FetchRangeKey: Int] = [:]
         for term in reconstruction.terms {
             guard let fetchInfos = reconstruction.fetchInfo[term.hash] else {
                 throw XetDownloaderError.invalidReconstruction
@@ -319,6 +324,7 @@ public struct XetDownloader: Sendable {
                 urlRangeStart: fetchInfo.urlRange.lowerBound,
                 urlRangeEnd: fetchInfo.urlRange.upperBound
             )
+            expectedUnpackedBytesByKey[key, default: 0] += Int(term.unpackedLength)
 
             termContexts.append(
                 TermContext(
@@ -335,7 +341,6 @@ public struct XetDownloader: Sendable {
         var totalWritten: Int64 = 0
         var writeOffset: Int64 = 0
         let fetchSemaphore = AsyncSemaphore(value: maxConcurrentFetches)
-        let writeSemaphore = AsyncSemaphore(value: maxConcurrentWrites)
         var inflightFetches: [FetchRangeKey: Task<FetchedXorb, Error>] = [:]
         let randomAccessWriter = writer as? RandomAccessOutputWriter
 
@@ -386,8 +391,6 @@ public struct XetDownloader: Sendable {
             writeOffset += Int64(upper - lower)
 
             if let randomWriter = randomAccessWriter {
-                await writeSemaphore.acquire()
-                defer { Task { await writeSemaphore.release() } }
                 try base.withUnsafeBytes { raw in
                     guard let baseAddress = raw.baseAddress else {
                         throw XetDownloaderError.invalidReconstruction
@@ -408,6 +411,7 @@ public struct XetDownloader: Sendable {
             let term = context.term
             let key = context.key
             let shouldCacheAllForXorb = (xorbUsageCount[term.hash] ?? 0) > 1
+            let expectedUnpackedLength = expectedUnpackedBytesByKey[key]
 
             if inflightFetches[key] != nil {
                 return
@@ -422,7 +426,8 @@ public struct XetDownloader: Sendable {
                 return try await fetchXorbChunks(
                     termHash: term.hash,
                     fetchInfo: context.fetchInfo,
-                    request: context.request
+                    request: context.request,
+                    expectedUnpackedLength: expectedUnpackedLength
                 )
             }
         }
@@ -477,7 +482,8 @@ public struct XetDownloader: Sendable {
     private func fetchXorbChunks(
         termHash: String,
         fetchInfo: CASClient.ReconstructionResponse.FetchInfo,
-        request: URLRequest
+        request: URLRequest,
+        expectedUnpackedLength: Int?
     ) async throws -> FetchedXorb {
         logDebug(
             "XET DEBUG: fetch start xorbHash=\(termHash.prefix(12)) range=\(fetchInfo.range.lowerBound)..<\(fetchInfo.range.upperBound)"
@@ -504,28 +510,32 @@ public struct XetDownloader: Sendable {
         logDebug(
             "XET DEBUG: response status=\(statusCode) version=\(response.version) contentLength=\(response.headers.first(name: "Content-Length") ?? "nil")"
         )
-        let body = response.body
-        let stream = AsyncThrowingStream<Data, Error> { continuation in
-            Task {
+        let bufferSlots = max(2, min(maxInflightBuffers, maxConcurrentDecodes))
+        let bufferSemaphore = AsyncSemaphore(value: bufferSlots)
+        let stream = AsyncThrowingStream<ByteBuffer, Error> { continuation in
+            let task = Task {
                 do {
-                    for try await buffer in body {
+                    for try await buffer in response.body {
                         if buffer.readableBytes == 0 {
                             continue
                         }
-                        if let data = buffer.getData(
-                            at: buffer.readerIndex,
-                            length: buffer.readableBytes
-                        ) {
-                            continuation.yield(data)
-                        }
+                        await bufferSemaphore.acquire()
+                        continuation.yield(buffer)
                     }
                     continuation.finish()
                 } catch {
                     continuation.finish(throwing: error)
                 }
             }
+            continuation.onTermination = { _ in
+                task.cancel()
+            }
         }
-        let decoded = try await decodeXorbStream(stream: stream)
+        let decoded = try await decodeXorbStream(
+            stream: stream,
+            bufferSemaphore: bufferSemaphore,
+            expectedUnpackedLength: expectedUnpackedLength
+        )
         logDebug(
             "XET DEBUG: finished fetch loop for xorbHash=\(termHash.prefix(12)) chunks=\(decoded.chunkByteIndices.count - 1)"
         )
@@ -537,42 +547,45 @@ public struct XetDownloader: Sendable {
     }
 
     private func decodeXorbStream(
-        stream: AsyncThrowingStream<Data, Error>
+        stream: AsyncThrowingStream<ByteBuffer, Error>,
+        bufferSemaphore: AsyncSemaphore,
+        expectedUnpackedLength: Int?
     ) async throws -> (data: Data, chunkByteIndices: [Int]) {
-        var iterator = stream.makeAsyncIterator()
         var cursor = ByteCursor()
-        var reachedEOF = false
         var data = Data()
         var chunkByteIndices: [Int] = [0]
+        if let expectedUnpackedLength, expectedUnpackedLength > 0 {
+            data.reserveCapacity(expectedUnpackedLength)
+        }
 
-        while true {
-            if let headerBytes = cursor.peek(count: 8) {
-                let header = try Xorb.parseHeader(headerBytes)
-                if cursor.count >= 8 + header.compressedLength {
-                    _ = cursor.take(count: 8)
-                    guard let compressed = cursor.take(count: header.compressedLength) else {
-                        throw XorbError.truncatedStream
-                    }
-                    let uncompressed = try Xorb.decodePayload(compressed: compressed, header: header)
+        func drainCursor(isEOF: Bool) throws {
+            while true {
+                if let uncompressed = try Xorb.decodeNextChunk(from: &cursor) {
                     data.append(uncompressed)
                     chunkByteIndices.append(data.count)
                     continue
-                } else if reachedEOF {
+                }
+                if isEOF {
+                    if cursor.count == 0 {
+                        return
+                    }
                     throw XorbError.truncatedStream
                 }
-            } else if reachedEOF {
-                if cursor.count == 0 {
-                    break
-                }
-                throw XorbError.truncatedStream
-            }
-
-            if let chunk = try await iterator.next() {
-                cursor.append(chunk)
-            } else {
-                reachedEOF = true
+                break
             }
         }
+
+        for try await buffer in stream {
+            if buffer.readableBytes > 0 {
+                buffer.withUnsafeReadableBytes { raw in
+                    cursor.append(raw)
+                }
+            }
+            await bufferSemaphore.release()
+            try drainCursor(isEOF: false)
+        }
+
+        try drainCursor(isEOF: true)
         return (data: data, chunkByteIndices: chunkByteIndices)
     }
 
