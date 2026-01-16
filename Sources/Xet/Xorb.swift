@@ -33,6 +33,15 @@ public enum Xorb {
         ChunkSequence(source: bytes)
     }
 
+    /// Decodes an async data sequence into uncompressed chunks.
+    ///
+    /// - Parameter buffers: An async sequence of `Data` buffers representing xorb data.
+    /// - Returns: An async sequence yielding uncompressed `Data` for each chunk.
+    public static func decode<S: AsyncSequence>(buffers: S) -> DataChunkSequence<S>
+    where S.Element == Data {
+        DataChunkSequence(source: buffers)
+    }
+
     /// Compression schemes supported by the xorb format.
     enum CompressionScheme: UInt8, Sendable {
         /// No compression; data stored as-is.
@@ -181,6 +190,65 @@ extension Xorb {
 
                     if let b = try await iterator.next() {
                         cursor.append(b)
+                    } else {
+                        reachedEOF = true
+                    }
+                }
+            }
+        }
+    }
+}
+
+// MARK: - Xorb.DataChunkSequence
+
+extension Xorb {
+    /// An async sequence that yields uncompressed chunks from xorb data.
+    ///
+    /// Wraps a source `Data` stream and parses/decompresses chunks on demand.
+    /// Each iteration yields the decompressed `Data` for one chunk.
+    public struct DataChunkSequence<S: AsyncSequence>: AsyncSequence where S.Element == Data {
+        public typealias Element = Data
+
+        fileprivate let source: S
+
+        public func makeAsyncIterator() -> AsyncIterator {
+            AsyncIterator(source: source)
+        }
+
+        public struct AsyncIterator: AsyncIteratorProtocol {
+            private var iterator: S.AsyncIterator
+            private var cursor = ByteCursor()
+            private var reachedEOF = false
+
+            fileprivate init(source: S) {
+                self.iterator = source.makeAsyncIterator()
+            }
+
+            public mutating func next() async throws -> Data? {
+                while true {
+                    if let headerBytes = cursor.peek(count: 8) {
+                        let header = try Xorb.parseHeader(headerBytes)
+                        if cursor.count >= 8 + header.compressedLength {
+                            _ = cursor.take(count: 8)
+                            guard let compressed = cursor.take(count: header.compressedLength) else {
+                                throw XorbError.truncatedStream
+                            }
+                            return try Xorb.decodePayload(
+                                compressed: compressed,
+                                header: header
+                            )
+                        } else if reachedEOF {
+                            throw XorbError.truncatedStream
+                        }
+                    } else if reachedEOF {
+                        if cursor.count == 0 {
+                            return nil
+                        }
+                        throw XorbError.truncatedStream
+                    }
+
+                    if let data = try await iterator.next() {
+                        cursor.append(data)
                     } else {
                         reachedEOF = true
                     }

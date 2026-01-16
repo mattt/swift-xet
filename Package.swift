@@ -19,11 +19,20 @@ let package = Package(
             targets: ["Xet"]
         )
     ],
+    dependencies: [
+        .package(url: "https://github.com/swift-server/async-http-client", from: "1.30.0"),
+        .package(url: "https://github.com/apple/swift-nio.git", from: "2.64.0"),
+    ],
     targets: [
         // Targets are the basic building blocks of a package, defining a module or a test suite.
         // Targets can depend on other targets in this package and products from dependencies.
         .target(
-            name: "Xet"
+            name: "Xet",
+            dependencies: [
+                .product(name: "AsyncHTTPClient", package: "async-http-client"),
+                .product(name: "NIOCore", package: "swift-nio"),
+                .product(name: "NIOHTTP1", package: "swift-nio"),
+            ]
         ),
         .testTarget(
             name: "XetTests",
