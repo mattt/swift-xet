@@ -349,6 +349,17 @@ struct ByteCursor {
         return head
     }
 
+    /// Skips the next `n` bytes without allocating a new buffer.
+    ///
+    /// - Parameter n: Number of bytes to skip.
+    /// - Returns: `true` if skipped, `false` if insufficient bytes available.
+    mutating func skip(count n: Int) -> Bool {
+        guard count >= n else { return false }
+        startIndex += n
+        compactIfNeeded()
+        return true
+    }
+
     /// Removes consumed bytes when the prefix is large enough to warrant it.
     private mutating func compactIfNeeded() {
         if startIndex == buffer.count {

@@ -1,5 +1,9 @@
 import Foundation
 
+#if canImport(Compression)
+    import Compression
+#endif
+
 /// LZ4 decompression for raw blocks and standard frames.
 ///
 /// LZ4 is a fast lossless compression algorithm optimized for speed.
@@ -49,6 +53,33 @@ public enum LZ4 {
         return raw
     }
 
+    public static func decompressBlock(
+        _ compressed: UnsafeRawBufferPointer,
+        uncompressedLength: Int
+    ) throws -> Data {
+        precondition(uncompressedLength >= 0)
+        if uncompressedLength == 0 {
+            return Data()
+        }
+
+        if compressed.count >= 4,
+            let base = compressed.bindMemory(to: UInt8.self).baseAddress,
+            base[0] == 0x04,
+            base[1] == 0x22,
+            base[2] == 0x4D,
+            base[3] == 0x18
+        {
+            let data = Data(bytes: base, count: compressed.count)
+            let framed = try decompressStandardFrame(data, expectedSize: uncompressedLength)
+            guard framed.count == uncompressedLength else { throw LZ4Error.decompressionFailed }
+            return framed
+        }
+
+        let raw = try decompressRawBlock(compressed, maxOutputSize: uncompressedLength)
+        guard raw.count == uncompressedLength else { throw LZ4Error.decompressionFailed }
+        return raw
+    }
+
     // MARK: - Raw LZ4 Block Decoding
 
     /// Decompresses a raw LZ4 block without frame headers.
@@ -65,6 +96,31 @@ public enum LZ4 {
     /// - Throws: ``LZ4Error/invalidFrame`` if the block is malformed.
     public static func decompressRawBlock(_ compressed: Data, maxOutputSize: Int) throws -> Data {
         if maxOutputSize == 0 { return Data() }
+
+        #if canImport(Compression)
+            if !compressed.isEmpty {
+                guard let dst = malloc(maxOutputSize) else {
+                    throw LZ4Error.decompressionFailed
+                }
+                let decodedCount = compressed.withUnsafeBytes { srcBuffer -> Int in
+                    guard let srcBase = srcBuffer.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
+                        return 0
+                    }
+                    return compression_decode_buffer(
+                        dst.assumingMemoryBound(to: UInt8.self),
+                        maxOutputSize,
+                        srcBase,
+                        compressed.count,
+                        nil,
+                        COMPRESSION_LZ4_RAW
+                    )
+                }
+                if decodedCount > 0 {
+                    return Data(bytesNoCopy: dst, count: decodedCount, deallocator: .free)
+                }
+                free(dst)
+            }
+        #endif
 
         let src = [UInt8](compressed)
         var i = 0
@@ -122,6 +178,41 @@ public enum LZ4 {
         }
 
         return Data(out)
+    }
+
+    public static func decompressRawBlock(
+        _ compressed: UnsafeRawBufferPointer,
+        maxOutputSize: Int
+    ) throws -> Data {
+        if maxOutputSize == 0 { return Data() }
+
+        #if canImport(Compression)
+            if compressed.count > 0, let base = compressed.bindMemory(to: UInt8.self).baseAddress {
+                guard let dst = malloc(maxOutputSize) else {
+                    throw LZ4Error.decompressionFailed
+                }
+                let decodedCount = compression_decode_buffer(
+                    dst.assumingMemoryBound(to: UInt8.self),
+                    maxOutputSize,
+                    base,
+                    compressed.count,
+                    nil,
+                    COMPRESSION_LZ4_RAW
+                )
+                if decodedCount > 0 {
+                    return Data(bytesNoCopy: dst, count: decodedCount, deallocator: .free)
+                }
+                free(dst)
+            }
+        #endif
+
+        let data: Data
+        if let base = compressed.baseAddress, compressed.count > 0 {
+            data = Data(bytes: base, count: compressed.count)
+        } else {
+            data = Data()
+        }
+        return try decompressRawBlock(data, maxOutputSize: maxOutputSize)
     }
 
     // MARK: - Standard LZ4 Frame Decoding
