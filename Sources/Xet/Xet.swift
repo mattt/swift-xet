@@ -551,12 +551,17 @@ public struct XetDownloader: Sendable {
         bufferSemaphore: AsyncSemaphore,
         expectedUnpackedLength: Int?
     ) async throws -> (data: Data, chunkByteIndices: [Int]) {
+        if let expectedUnpackedLength, expectedUnpackedLength > 0 {
+            return try await decodeXorbStreamPipelined(
+                stream: stream,
+                bufferSemaphore: bufferSemaphore,
+                totalOutputSize: expectedUnpackedLength
+            )
+        }
+
         var cursor = ByteCursor()
         var data = Data()
         var chunkByteIndices: [Int] = [0]
-        if let expectedUnpackedLength, expectedUnpackedLength > 0 {
-            data.reserveCapacity(expectedUnpackedLength)
-        }
 
         func drainCursor(isEOF: Bool) throws {
             while true {
@@ -587,6 +592,194 @@ public struct XetDownloader: Sendable {
 
         try drainCursor(isEOF: true)
         return (data: data, chunkByteIndices: chunkByteIndices)
+    }
+
+    private func decodeXorbStreamPipelined(
+        stream: AsyncThrowingStream<ByteBuffer, Error>,
+        bufferSemaphore: AsyncSemaphore,
+        totalOutputSize: Int
+    ) async throws -> (data: Data, chunkByteIndices: [Int]) {
+        let outputBuffer = UnsafeMutableRawPointer.allocate(
+            byteCount: totalOutputSize,
+            alignment: 16
+        )
+        let bufferWrapper = SendableBufferWrapper(baseAddress: outputBuffer, count: totalOutputSize)
+        let resultCollector = DecodeResultCollector()
+
+        let (jobStream, jobContinuation) = AsyncStream<(DecodeJob, Int)>.makeStream(
+            bufferingPolicy: .bufferingNewest(maxConcurrentDecodes * 2)
+        )
+
+        var cursor = ByteCursor()
+        var chunkIndex = 0
+        var writeOffset = 0
+
+        async let workersDone: Void = withThrowingTaskGroup(of: Void.self) { group in
+            for _ in 0 ..< self.maxConcurrentDecodes {
+                group.addTask { [bufferWrapper, resultCollector] in
+                    for await (job, offset) in jobStream {
+                        do {
+                            let outputSlice = UnsafeMutableRawBufferPointer(
+                                start: bufferWrapper.baseAddress.advanced(by: offset),
+                                count: job.uncompressedLength
+                            )
+                            try Self.decodeChunkInto(job: job, output: outputSlice)
+                            await resultCollector.recordSuccess(
+                                index: job.index,
+                                endOffset: offset + job.uncompressedLength
+                            )
+                        } catch {
+                            await resultCollector.recordError(error)
+                        }
+                    }
+                }
+            }
+            for try await _ in group {}
+        }
+
+        for try await buffer in stream {
+            if buffer.readableBytes > 0 {
+                buffer.withUnsafeReadableBytes { raw in
+                    cursor.append(raw)
+                }
+            }
+            await bufferSemaphore.release()
+
+            while let job = try extractNextDecodeJob(from: &cursor, chunkIndex: chunkIndex) {
+                let jobWriteOffset = writeOffset
+                writeOffset += job.uncompressedLength
+                chunkIndex += 1
+                jobContinuation.yield((job, jobWriteOffset))
+            }
+        }
+
+        while let job = try extractNextDecodeJob(from: &cursor, chunkIndex: chunkIndex, isEOF: true) {
+            let jobWriteOffset = writeOffset
+            writeOffset += job.uncompressedLength
+            chunkIndex += 1
+            jobContinuation.yield((job, jobWriteOffset))
+        }
+
+        if cursor.count > 0 {
+            outputBuffer.deallocate()
+            throw XorbError.truncatedStream
+        }
+
+        jobContinuation.finish()
+        try await workersDone
+
+        if let error = await resultCollector.firstError {
+            outputBuffer.deallocate()
+            throw error
+        }
+
+        var chunkByteIndices: [Int] = [0]
+        let sortedOffsets = await resultCollector.sortedEndOffsets
+        for offset in sortedOffsets {
+            chunkByteIndices.append(offset)
+        }
+
+        let data = Data(
+            bytesNoCopy: outputBuffer,
+            count: writeOffset,
+            deallocator: .custom { ptr, _ in ptr.deallocate() }
+        )
+        return (data: data, chunkByteIndices: chunkByteIndices)
+    }
+
+    private struct SendableBufferWrapper: @unchecked Sendable {
+        let baseAddress: UnsafeMutableRawPointer
+        let count: Int
+    }
+
+    private struct DecodeJob: Sendable {
+        let index: Int
+        let compressedData: Data
+        let compressionScheme: Xorb.CompressionScheme
+        let uncompressedLength: Int
+    }
+
+    private func extractNextDecodeJob(
+        from cursor: inout ByteCursor,
+        chunkIndex: Int,
+        isEOF: Bool = false
+    ) throws -> DecodeJob? {
+        guard cursor.count >= 8 else {
+            if isEOF && cursor.count > 0 {
+                throw XorbError.truncatedStream
+            }
+            return nil
+        }
+
+        guard let headerBytes = cursor.peek(count: 8) else {
+            return nil
+        }
+
+        let header = try headerBytes.withUnsafeBytes { raw in
+            try Xorb.parseHeader(raw)
+        }
+
+        let totalLength = 8 + header.compressedLength
+        guard cursor.count >= totalLength else {
+            if isEOF {
+                throw XorbError.truncatedStream
+            }
+            return nil
+        }
+
+        _ = cursor.skip(count: 8)
+        guard let payload = cursor.take(count: header.compressedLength) else {
+            throw XorbError.truncatedStream
+        }
+
+        return DecodeJob(
+            index: chunkIndex,
+            compressedData: payload,
+            compressionScheme: header.compressionScheme,
+            uncompressedLength: header.uncompressedLength
+        )
+    }
+
+    private static func decodeChunkInto(job: DecodeJob, output: UnsafeMutableRawBufferPointer) throws {
+        switch job.compressionScheme {
+        case .none:
+            guard job.compressedData.count == job.uncompressedLength else {
+                throw XorbError.lengthMismatch(
+                    expected: job.uncompressedLength,
+                    actual: job.compressedData.count
+                )
+            }
+            job.compressedData.withUnsafeBytes { src in
+                if let srcBase = src.baseAddress, let dstBase = output.baseAddress {
+                    memcpy(dstBase, srcBase, job.compressedData.count)
+                }
+            }
+
+        case .lz4:
+            try job.compressedData.withUnsafeBytes { compressed in
+                _ = try LZ4.decompressBlockInto(
+                    compressed,
+                    uncompressedLength: job.uncompressedLength,
+                    output: output
+                )
+            }
+
+        case .byteGrouping4LZ4:
+            let scratchSize = job.uncompressedLength
+            let scratch = UnsafeMutableRawBufferPointer.allocate(byteCount: scratchSize, alignment: 16)
+            defer { scratch.deallocate() }
+
+            try job.compressedData.withUnsafeBytes { compressed in
+                _ = try LZ4.decompressBlockInto(
+                    compressed,
+                    uncompressedLength: job.uncompressedLength,
+                    output: scratch
+                )
+            }
+
+            let scratchRead = UnsafeRawBufferPointer(scratch)
+            BG4.regroupInto(from: scratchRead, to: output)
+        }
     }
 
     private struct TermContext {
@@ -622,6 +815,51 @@ private actor AsyncSemaphore {
         } else {
             available += 1
         }
+    }
+}
+
+private actor DecodeResultCollector {
+    private var endOffsets: [(index: Int, offset: Int)] = []
+    private(set) var firstError: Error?
+    private var completedCount = 0
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+    private var expectedCount: Int?
+
+    func recordSuccess(index: Int, endOffset: Int) {
+        endOffsets.append((index: index, offset: endOffset))
+        completedCount += 1
+        checkCompletion()
+    }
+
+    func recordError(_ error: Error) {
+        if firstError == nil {
+            firstError = error
+        }
+        completedCount += 1
+        checkCompletion()
+    }
+
+    func waitForAll(count: Int) async {
+        if completedCount >= count {
+            return
+        }
+        expectedCount = count
+        await withCheckedContinuation { continuation in
+            waiters.append(continuation)
+            checkCompletion()
+        }
+    }
+
+    private func checkCompletion() {
+        guard let expected = expectedCount, completedCount >= expected else { return }
+        for waiter in waiters {
+            waiter.resume()
+        }
+        waiters.removeAll()
+    }
+
+    var sortedEndOffsets: [Int] {
+        endOffsets.sorted { $0.index < $1.index }.map(\.offset)
     }
 }
 

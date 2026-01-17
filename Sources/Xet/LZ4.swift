@@ -215,6 +215,78 @@ public enum LZ4 {
         return try decompressRawBlock(data, maxOutputSize: maxOutputSize)
     }
 
+    public static func decompressRawBlockInto(
+        _ compressed: UnsafeRawBufferPointer,
+        output: UnsafeMutableRawBufferPointer
+    ) throws -> Int {
+        let maxOutputSize = output.count
+        if maxOutputSize == 0 { return 0 }
+
+        #if canImport(Compression)
+            if compressed.count > 0,
+                let srcBase = compressed.bindMemory(to: UInt8.self).baseAddress,
+                let dstBase = output.baseAddress?.assumingMemoryBound(to: UInt8.self)
+            {
+                let decodedCount = compression_decode_buffer(
+                    dstBase,
+                    maxOutputSize,
+                    srcBase,
+                    compressed.count,
+                    nil,
+                    COMPRESSION_LZ4_RAW
+                )
+                if decodedCount > 0 {
+                    return decodedCount
+                }
+                throw LZ4Error.decompressionFailed
+            }
+        #endif
+
+        let data = try decompressRawBlock(compressed, maxOutputSize: maxOutputSize)
+        guard data.count <= maxOutputSize else {
+            throw LZ4Error.decompressionFailed
+        }
+        data.withUnsafeBytes { src in
+            if let srcBase = src.baseAddress, let dstBase = output.baseAddress {
+                memcpy(dstBase, srcBase, data.count)
+            }
+        }
+        return data.count
+    }
+
+    public static func decompressBlockInto(
+        _ compressed: UnsafeRawBufferPointer,
+        uncompressedLength: Int,
+        output: UnsafeMutableRawBufferPointer
+    ) throws -> Int {
+        guard uncompressedLength > 0 else { return 0 }
+        guard output.count >= uncompressedLength else {
+            throw LZ4Error.decompressionFailed
+        }
+
+        if compressed.count >= 4,
+            let base = compressed.bindMemory(to: UInt8.self).baseAddress,
+            base[0] == 0x04,
+            base[1] == 0x22,
+            base[2] == 0x4D,
+            base[3] == 0x18
+        {
+            let data = Data(bytes: base, count: compressed.count)
+            let framed = try decompressStandardFrame(data, expectedSize: uncompressedLength)
+            guard framed.count == uncompressedLength else {
+                throw LZ4Error.decompressionFailed
+            }
+            framed.withUnsafeBytes { src in
+                if let srcBase = src.baseAddress, let dstBase = output.baseAddress {
+                    memcpy(dstBase, srcBase, framed.count)
+                }
+            }
+            return framed.count
+        }
+
+        return try decompressRawBlockInto(compressed, output: output)
+    }
+
     // MARK: - Standard LZ4 Frame Decoding
 
     /// Decompresses a standard LZ4 frame.
