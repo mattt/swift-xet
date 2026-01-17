@@ -81,14 +81,14 @@ public struct XetDownloader: Sendable {
 
         public static let highThroughput: Configuration = {
             var config = Configuration()
-            config.maxConcurrentFetches = 512
+            config.maxConcurrentFetches = 64
             config.maxConcurrentDecodes = Configuration.recommendedDecodeConcurrency
-            config.maxConcurrentWrites = 512
+            config.maxConcurrentWrites = 64
             config.maxInflightBuffers = 16
-            config.connectionsPerHost = 256
-            config.prewarmedConnections = 64
-            config.poolSize = 6
-            config.connectTimeout = 5
+            config.connectionsPerHost = 32
+            config.prewarmedConnections = 16
+            config.poolSize = 1
+            config.connectTimeout = 60
             config.readTimeout = 120
             return config
         }()
