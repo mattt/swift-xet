@@ -1,4 +1,5 @@
 import Foundation
+import NIOCore
 
 // MARK: - Xorb
 
@@ -24,24 +25,6 @@ import Foundation
 /// }
 /// ```
 public enum Xorb {
-    /// Decodes an async byte sequence into uncompressed chunks.
-    ///
-    /// - Parameter bytes: An async sequence of bytes representing xorb data.
-    /// - Returns: An async sequence yielding uncompressed `Data` for each chunk.
-    public static func decode<S: AsyncSequence>(bytes: S) -> ChunkSequence<S>
-    where S.Element == UInt8 {
-        ChunkSequence(source: bytes)
-    }
-
-    /// Decodes an async data sequence into uncompressed chunks.
-    ///
-    /// - Parameter buffers: An async sequence of `Data` buffers representing xorb data.
-    /// - Returns: An async sequence yielding uncompressed `Data` for each chunk.
-    public static func decode<S: AsyncSequence>(buffers: S) -> DataChunkSequence<S>
-    where S.Element == Data {
-        DataChunkSequence(source: buffers)
-    }
-
     /// Compression schemes supported by the xorb format.
     enum CompressionScheme: UInt8, Sendable {
         /// No compression; data stored as-is.
@@ -181,6 +164,174 @@ public enum Xorb {
         }
     }
 
+    static func decodeNextChunk(from buffer: inout ByteBuffer) throws -> Data? {
+        var consumeCount = 0
+        let chunk = try buffer.withUnsafeReadableBytes { raw -> Data? in
+            guard raw.count >= 8 else { return nil }
+            let header = try parseHeader(UnsafeRawBufferPointer(raw))
+            let totalLength = 8 + header.compressedLength
+            guard raw.count >= totalLength else { return nil }
+            guard let base = raw.baseAddress else { return nil }
+            let payloadStart = base.advanced(by: 8)
+            let payload = UnsafeRawBufferPointer(start: payloadStart, count: header.compressedLength)
+            consumeCount = totalLength
+            return try decodePayload(compressed: payload, header: header)
+        }
+        if chunk != nil {
+            buffer.moveReaderIndex(forwardBy: consumeCount)
+        }
+        return chunk
+    }
+
+    /// Decodes the next chunk directly into an output buffer.
+    ///
+    /// This variant avoids allocating a new `Data` for each chunk by writing
+    /// directly into the caller's pre-allocated buffer.
+    ///
+    /// - Parameters:
+    ///   - buffer: The ByteBuffer containing compressed xorb data.
+    ///   - output: The destination buffer to write decompressed data into.
+    ///   - offset: The byte offset within `output` to start writing.
+    ///   - scratch: Optional scratch buffer for BG4 regrouping (required only
+    ///     for `.byteGrouping4LZ4` chunks, must be >= chunk uncompressed size).
+    ///
+    /// - Returns: The number of bytes written, or `nil` if not enough data available.
+    ///
+    /// - Throws: ``XorbError`` if decompression fails.
+    static func decodeNextChunk(
+        from buffer: inout ByteBuffer,
+        into output: UnsafeMutableRawBufferPointer,
+        at offset: Int,
+        scratch: UnsafeMutableRawBufferPointer?
+    ) throws -> Int? {
+        var consumeCount = 0
+
+        let bytesWritten: Int? = try buffer.withUnsafeReadableBytes { raw -> Int? in
+            guard raw.count >= 8 else { return nil }
+            let h = try parseHeader(UnsafeRawBufferPointer(raw))
+            let totalLength = 8 + h.compressedLength
+            guard raw.count >= totalLength else { return nil }
+            guard let base = raw.baseAddress else { return nil }
+            let payloadStart = base.advanced(by: 8)
+            let payload = UnsafeRawBufferPointer(start: payloadStart, count: h.compressedLength)
+            consumeCount = totalLength
+
+            guard offset + h.uncompressedLength <= output.count else {
+                throw XorbError.lengthMismatch(
+                    expected: h.uncompressedLength,
+                    actual: output.count - offset
+                )
+            }
+
+            guard let destBase = output.baseAddress?.advanced(by: offset) else {
+                throw XorbError.decompressionFailed
+            }
+
+            switch h.compressionScheme {
+            case .none:
+                guard payload.count == h.uncompressedLength else {
+                    throw XorbError.lengthMismatch(
+                        expected: h.uncompressedLength,
+                        actual: payload.count
+                    )
+                }
+                if let src = payload.baseAddress {
+                    memcpy(destBase, src, payload.count)
+                }
+                return h.uncompressedLength
+
+            case .lz4:
+                let written = try LZ4.decompressBlock(
+                    payload,
+                    into: destBase,
+                    maxOutputSize: h.uncompressedLength
+                )
+                guard written == h.uncompressedLength else {
+                    throw XorbError.decompressionFailed
+                }
+                return written
+
+            case .byteGrouping4LZ4:
+                guard let scratchBase = scratch?.baseAddress,
+                    scratch!.count >= h.uncompressedLength
+                else {
+                    throw XorbError.decompressionFailed
+                }
+                let written = try LZ4.decompressBlock(
+                    payload,
+                    into: scratchBase,
+                    maxOutputSize: h.uncompressedLength
+                )
+                guard written == h.uncompressedLength else {
+                    throw XorbError.decompressionFailed
+                }
+                let srcBuffer = UnsafeRawBufferPointer(start: scratchBase, count: written)
+                let dstBuffer = UnsafeMutableRawBufferPointer(start: destBase, count: written)
+                BG4.regroup(from: srcBuffer, into: dstBuffer)
+                return written
+            }
+        }
+
+        if bytesWritten != nil {
+            buffer.moveReaderIndex(forwardBy: consumeCount)
+        }
+        return bytesWritten
+    }
+}
+
+
+
+// MARK: - ByteCursor
+
+/// A byte buffer with cursor-based reading and automatic compaction.
+///
+/// Provides efficient streaming reads without repeatedly copying data.
+/// The buffer compacts itself when the consumed prefix grows large.
+struct ByteCursor {
+    private var buffer = Data()
+    private var startIndex: Int = 0
+
+    /// The number of unread bytes in the buffer.
+    var count: Int { buffer.count - startIndex }
+
+    /// Provides unsafe access to the unread portion of the buffer.
+    func withUnsafeReadableBytes<T>(_ body: (UnsafeRawBufferPointer) throws -> T) rethrows -> T {
+        try buffer.withUnsafeBytes { raw in
+            let readableCount = max(0, raw.count - startIndex)
+            let start = raw.baseAddress?.advanced(by: startIndex)
+            let readable = UnsafeRawBufferPointer(start: start, count: readableCount)
+            return try body(readable)
+        }
+    }
+
+    /// Appends raw bytes to the buffer.
+    mutating func append(_ bytes: UnsafeRawBufferPointer) {
+        let typed = bytes.bindMemory(to: UInt8.self)
+        buffer.append(contentsOf: typed)
+    }
+
+    /// Consumes the next `n` bytes.
+    mutating func consume(count n: Int) {
+        startIndex += n
+        compactIfNeeded()
+    }
+
+    /// Removes consumed bytes when the prefix is large enough to warrant it.
+    private mutating func compactIfNeeded() {
+        if startIndex == buffer.count {
+            buffer.removeAll(keepingCapacity: true)
+            startIndex = 0
+            return
+        }
+
+        if startIndex > 4096, startIndex * 2 > buffer.count {
+            buffer.removeSubrange(0 ..< startIndex)
+            startIndex = 0
+        }
+    }
+}
+
+extension Xorb {
     static func decodeNextChunk(from cursor: inout ByteCursor) throws -> Data? {
         var consumeCount = 0
         let chunk = try cursor.withUnsafeReadableBytes { raw -> Data? in
@@ -198,104 +349,6 @@ public enum Xorb {
             cursor.consume(count: consumeCount)
         }
         return chunk
-    }
-}
-
-// MARK: - Xorb.ChunkSequence
-
-extension Xorb {
-    /// An async sequence that yields uncompressed chunks from xorb data.
-    ///
-    /// Wraps a source byte stream and parses/decompresses chunks on demand.
-    /// Each iteration yields the decompressed `Data` for one chunk.
-    public struct ChunkSequence<S: AsyncSequence>: AsyncSequence where S.Element == UInt8 {
-        public typealias Element = Data
-
-        fileprivate let source: S
-
-        public func makeAsyncIterator() -> AsyncIterator {
-            AsyncIterator(source: source)
-        }
-
-        /// The async iterator for xorb chunk decoding.
-        public struct AsyncIterator: AsyncIteratorProtocol {
-            private var iterator: S.AsyncIterator
-            private var cursor = ByteCursor()
-            private var reachedEOF = false
-
-            fileprivate init(source: S) {
-                self.iterator = source.makeAsyncIterator()
-            }
-
-            /// Returns the next uncompressed chunk, or `nil` at end of stream.
-            public mutating func next() async throws -> Data? {
-                while true {
-                    if let chunk = try Xorb.decodeNextChunk(from: &cursor) {
-                        return chunk
-                    }
-                    if reachedEOF {
-                        if cursor.count == 0 {
-                            return nil
-                        }
-                        throw XorbError.truncatedStream
-                    }
-
-                    if let b = try await iterator.next() {
-                        cursor.append(b)
-                    } else {
-                        reachedEOF = true
-                    }
-                }
-            }
-        }
-    }
-}
-
-// MARK: - Xorb.DataChunkSequence
-
-extension Xorb {
-    /// An async sequence that yields uncompressed chunks from xorb data.
-    ///
-    /// Wraps a source `Data` stream and parses/decompresses chunks on demand.
-    /// Each iteration yields the decompressed `Data` for one chunk.
-    public struct DataChunkSequence<S: AsyncSequence>: AsyncSequence where S.Element == Data {
-        public typealias Element = Data
-
-        fileprivate let source: S
-
-        public func makeAsyncIterator() -> AsyncIterator {
-            AsyncIterator(source: source)
-        }
-
-        public struct AsyncIterator: AsyncIteratorProtocol {
-            private var iterator: S.AsyncIterator
-            private var cursor = ByteCursor()
-            private var reachedEOF = false
-
-            fileprivate init(source: S) {
-                self.iterator = source.makeAsyncIterator()
-            }
-
-            public mutating func next() async throws -> Data? {
-                while true {
-                    if let chunk = try Xorb.decodeNextChunk(from: &cursor) {
-                        return chunk
-                    }
-                    if reachedEOF {
-                        if cursor.count == 0 {
-                            return nil
-                        }
-                        throw XorbError.truncatedStream
-                    }
-
-                    if let data = try await iterator.next() {
-                        cursor.append(data)
-                    } else {
-                        reachedEOF = true
-                    }
-                }
-            }
-        }
     }
 }
 
@@ -341,98 +394,4 @@ extension XorbError: LocalizedError {
     }
 }
 
-// MARK: - ByteCursor
 
-/// A byte buffer with cursor-based reading and automatic compaction.
-///
-/// Provides efficient streaming reads without repeatedly copying data.
-/// The buffer compacts itself when the consumed prefix grows large.
-struct ByteCursor {
-    private var buffer = Data()
-    private var startIndex: Int = 0
-
-    /// The number of unread bytes in the buffer.
-    var count: Int { buffer.count - startIndex }
-
-    /// Provides unsafe access to the unread portion of the buffer.
-    func withUnsafeReadableBytes<T>(_ body: (UnsafeRawBufferPointer) throws -> T) rethrows -> T {
-        try buffer.withUnsafeBytes { raw in
-            let readableCount = max(0, raw.count - startIndex)
-            let start = raw.baseAddress?.advanced(by: startIndex)
-            let readable = UnsafeRawBufferPointer(start: start, count: readableCount)
-            return try body(readable)
-        }
-    }
-
-    /// Appends data to the buffer.
-    mutating func append(_ data: Data) {
-        buffer.append(data)
-    }
-
-    /// Appends bytes to the buffer.
-    mutating func append<S: Sequence>(_ bytes: S) where S.Element == UInt8 {
-        buffer.append(contentsOf: bytes)
-    }
-
-    /// Appends raw bytes to the buffer.
-    mutating func append(_ bytes: UnsafeRawBufferPointer) {
-        let typed = bytes.bindMemory(to: UInt8.self)
-        buffer.append(contentsOf: typed)
-    }
-
-    /// Appends a single byte to the buffer.
-    mutating func append(_ byte: UInt8) {
-        buffer.append(byte)
-    }
-
-    /// Peeks at the next `n` bytes without consuming them.
-    ///
-    /// - Parameter n: Number of bytes to peek.
-    /// - Returns: The bytes, or `nil` if fewer than `n` bytes available.
-    func peek(count n: Int) -> Data? {
-        guard count >= n else { return nil }
-        return buffer.subdata(in: startIndex ..< (startIndex + n))
-    }
-
-    /// Consumes and returns the next `n` bytes.
-    ///
-    /// - Parameter n: Number of bytes to consume.
-    /// - Returns: The bytes, or `nil` if fewer than `n` bytes available.
-    mutating func take(count n: Int) -> Data? {
-        guard count >= n else { return nil }
-        let head = buffer.subdata(in: startIndex ..< (startIndex + n))
-        startIndex += n
-        compactIfNeeded()
-        return head
-    }
-
-    /// Skips the next `n` bytes without allocating a new buffer.
-    ///
-    /// - Parameter n: Number of bytes to skip.
-    /// - Returns: `true` if skipped, `false` if insufficient bytes available.
-    mutating func skip(count n: Int) -> Bool {
-        guard count >= n else { return false }
-        consume(count: n)
-        return true
-    }
-
-    /// Consumes the next `n` bytes.
-    mutating func consume(count n: Int) {
-        startIndex += n
-        compactIfNeeded()
-    }
-
-    /// Removes consumed bytes when the prefix is large enough to warrant it.
-    private mutating func compactIfNeeded() {
-        if startIndex == buffer.count {
-            buffer.removeAll(keepingCapacity: true)
-            startIndex = 0
-            return
-        }
-
-        if startIndex > 4096, startIndex * 2 > buffer.count {
-            buffer.removeSubrange(0 ..< startIndex)
-            startIndex = 0
-        }
-    }
-}
