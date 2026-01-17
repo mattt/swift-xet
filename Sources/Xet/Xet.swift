@@ -3,7 +3,6 @@ import Darwin
 import Foundation
 import NIOCore
 import NIOHTTP1
-import os
 
 /// Downloads files from Hugging Face's content-addressable storage (CAS)
 /// using the Xet protocol.
@@ -423,19 +422,13 @@ public struct XetDownloader: Sendable {
 
             inflightFetches[key] = Task {
                 await fetchSemaphore.acquire()
-                do {
-                    let result = try await fetchXorbChunks(
-                        termHash: term.hash,
-                        fetchInfo: context.fetchInfo,
-                        request: context.request,
-                        expectedUnpackedLength: expectedUnpackedLength
-                    )
-                    await fetchSemaphore.release()
-                    return result
-                } catch {
-                    await fetchSemaphore.release()
-                    throw error
-                }
+                defer { Task { await fetchSemaphore.release() } }
+                return try await fetchXorbChunks(
+                    termHash: term.hash,
+                    fetchInfo: context.fetchInfo,
+                    request: context.request,
+                    expectedUnpackedLength: expectedUnpackedLength
+                )
             }
         }
 
@@ -514,9 +507,8 @@ public struct XetDownloader: Sendable {
         guard (200 ..< 300).contains(statusCode) || statusCode == 206 else {
             throw XetDownloaderError.fetchFailed(statusCode: statusCode, url: url)
         }
-        let contentLength = response.headers.first(name: "Content-Length").flatMap(Int.init)
         logDebug(
-            "XET DEBUG: response status=\(statusCode) version=\(response.version) contentLength=\(contentLength.map(String.init) ?? "nil")"
+            "XET DEBUG: response status=\(statusCode) version=\(response.version) contentLength=\(response.headers.first(name: "Content-Length") ?? "nil")"
         )
         let bufferSlots = max(2, min(maxInflightBuffers, maxConcurrentDecodes))
         let bufferSemaphore = AsyncSemaphore(value: bufferSlots)
@@ -542,8 +534,7 @@ public struct XetDownloader: Sendable {
         let decoded = try await decodeXorbStream(
             stream: stream,
             bufferSemaphore: bufferSemaphore,
-            expectedUnpackedLength: expectedUnpackedLength,
-            expectedCompressedLength: contentLength
+            expectedUnpackedLength: expectedUnpackedLength
         )
         logDebug(
             "XET DEBUG: finished fetch loop for xorbHash=\(termHash.prefix(12)) chunks=\(decoded.chunkByteIndices.count - 1)"
@@ -558,103 +549,24 @@ public struct XetDownloader: Sendable {
     private func decodeXorbStream(
         stream: AsyncThrowingStream<ByteBuffer, Error>,
         bufferSemaphore: AsyncSemaphore,
-        expectedUnpackedLength: Int?,
-        expectedCompressedLength: Int?
+        expectedUnpackedLength: Int?
     ) async throws -> (data: Data, chunkByteIndices: [Int]) {
-        var buffer = ByteBuffer()
-        if let capacity = expectedCompressedLength {
-            buffer.reserveCapacity(capacity)
-        }
-        var chunkByteIndices: [Int] = [0]
-
-        let useDirectWrite = expectedUnpackedLength != nil && expectedUnpackedLength! > 0
-
-        if useDirectWrite {
-            let totalSize = expectedUnpackedLength!
-            guard let outputBase = malloc(totalSize) else {
-                throw XorbError.decompressionFailed
-            }
-            let outputBuffer = UnsafeMutableRawBufferPointer(start: outputBase, count: totalSize)
-
-            var scratchBuffer: UnsafeMutableRawBufferPointer?
-            var writeOffset = 0
-
-            func ensureScratch(size: Int) {
-                if scratchBuffer == nil || scratchBuffer!.count < size {
-                    scratchBuffer?.deallocate()
-                    scratchBuffer = UnsafeMutableRawBufferPointer.allocate(
-                        byteCount: size,
-                        alignment: 8
-                    )
-                }
-            }
-
-            func drainBuffer(isEOF: Bool) throws {
-                while true {
-                    let peekedScheme = buffer.withUnsafeReadableBytes { raw -> UInt8? in
-                        guard raw.count >= 8 else { return nil }
-                        return raw[4]
-                    }
-                    if let scheme = peekedScheme, scheme == 2 {
-                        let uncompressedLen = buffer.withUnsafeReadableBytes { raw -> Int in
-                            guard raw.count >= 8 else { return 64 * 1024 }
-                            return Int(raw[5]) | (Int(raw[6]) << 8) | (Int(raw[7]) << 16)
-                        }
-                        ensureScratch(size: uncompressedLen)
-                    }
-                    if let bytesWritten = try Xorb.decodeNextChunk(
-                        from: &buffer,
-                        into: outputBuffer,
-                        at: writeOffset,
-                        scratch: scratchBuffer
-                    ) {
-                        writeOffset += bytesWritten
-                        chunkByteIndices.append(writeOffset)
-                        continue
-                    }
-                    if isEOF {
-                        if buffer.readableBytes == 0 {
-                            return
-                        }
-                        throw XorbError.truncatedStream
-                    }
-                    break
-                }
-            }
-
-            do {
-                for try await var incoming in stream {
-                    if incoming.readableBytes > 0 {
-                        buffer.writeBuffer(&incoming)
-                    }
-                    await bufferSemaphore.release()
-                    try drainBuffer(isEOF: false)
-                }
-
-                try drainBuffer(isEOF: true)
-            } catch {
-                free(outputBase)
-                scratchBuffer?.deallocate()
-                throw error
-            }
-
-            scratchBuffer?.deallocate()
-
-            let data = Data(bytesNoCopy: outputBase, count: writeOffset, deallocator: .free)
-            return (data: data, chunkByteIndices: chunkByteIndices)
-        }
-
+        var cursor = ByteCursor()
         var data = Data()
+        var chunkByteIndices: [Int] = [0]
+        if let expectedUnpackedLength, expectedUnpackedLength > 0 {
+            data.reserveCapacity(expectedUnpackedLength)
+        }
 
-        func drainBuffer(isEOF: Bool) throws {
+        func drainCursor(isEOF: Bool) throws {
             while true {
-                if let uncompressed = try Xorb.decodeNextChunk(from: &buffer) {
+                if let uncompressed = try Xorb.decodeNextChunk(from: &cursor) {
                     data.append(uncompressed)
                     chunkByteIndices.append(data.count)
                     continue
                 }
                 if isEOF {
-                    if buffer.readableBytes == 0 {
+                    if cursor.count == 0 {
                         return
                     }
                     throw XorbError.truncatedStream
@@ -663,15 +575,17 @@ public struct XetDownloader: Sendable {
             }
         }
 
-        for try await var incoming in stream {
-            if incoming.readableBytes > 0 {
-                buffer.writeBuffer(&incoming)
+        for try await buffer in stream {
+            if buffer.readableBytes > 0 {
+                buffer.withUnsafeReadableBytes { raw in
+                    cursor.append(raw)
+                }
             }
             await bufferSemaphore.release()
-            try drainBuffer(isEOF: false)
+            try drainCursor(isEOF: false)
         }
 
-        try drainBuffer(isEOF: true)
+        try drainCursor(isEOF: true)
         return (data: data, chunkByteIndices: chunkByteIndices)
     }
 
@@ -1151,171 +1065,6 @@ final class PwriteFileWriter: RandomAccessOutputWriter {
     }
 
     func close() async throws {
-        if Darwin.close(fd) != 0 {
-            throw POSIXError(POSIXError.Code(rawValue: errno) ?? .EIO)
-        }
-    }
-}
-
-/// A sequential output writer that batches writes using vectorized I/O (writev).
-///
-/// This writer accumulates buffers and flushes them in batches using the `writev`
-/// syscall, reducing syscall overhead compared to individual write calls.
-/// Suitable for sequential writes where data is appended in order.
-final class WritevFileWriter: RandomAccessOutputWriter, @unchecked Sendable {
-    private let fd: Int32
-    private let flushThreshold: Int
-    private var pendingBuffers: [Data] = []
-    private var pendingSize: Int = 0
-    private var currentOffset: Int64 = 0
-    private let lock = NSLock()
-
-    init(destinationURL: URL, flushThreshold: Int = 1024 * 1024) throws {
-        let fm = FileManager.default
-        if fm.fileExists(atPath: destinationURL.path) {
-            try fm.removeItem(at: destinationURL)
-        }
-        fm.createFile(atPath: destinationURL.path, contents: nil)
-        let flags = O_CREAT | O_RDWR | O_TRUNC
-        let mode: mode_t = S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH
-        let fd = open(destinationURL.path, flags, mode)
-        if fd < 0 {
-            throw POSIXError(POSIXError.Code(rawValue: errno) ?? .EIO)
-        }
-        self.fd = fd
-        self.flushThreshold = flushThreshold
-    }
-
-    func write(_ data: Data) async throws {
-        try lock.withLock {
-            if data.isEmpty { return }
-            pendingBuffers.append(data)
-            pendingSize += data.count
-            if pendingSize >= flushThreshold {
-                try flushLocked()
-            }
-        }
-    }
-
-    func write(_ data: Data, at offset: Int64) async throws {
-        try lock.withLock {
-            if !pendingBuffers.isEmpty {
-                try flushLocked()
-            }
-            currentOffset = offset
-            if data.isEmpty { return }
-            pendingBuffers.append(data)
-            pendingSize += data.count
-            if pendingSize >= flushThreshold {
-                try flushLocked()
-            }
-        }
-    }
-
-    func writeRaw(_ buffer: UnsafeRawBufferPointer, at offset: Int64) throws {
-        try lock.withLock {
-            if !pendingBuffers.isEmpty {
-                try flushLocked()
-            }
-            currentOffset = offset
-            if buffer.count == 0 { return }
-            guard let base = buffer.baseAddress else { return }
-            var remaining = buffer.count
-            var localOffset = 0
-            while remaining > 0 {
-                let written = pwrite(fd, base.advanced(by: localOffset), remaining, off_t(currentOffset))
-                if written < 0 {
-                    let err = errno
-                    if err == EINTR { continue }
-                    throw POSIXError(POSIXError.Code(rawValue: err) ?? .EIO)
-                }
-                remaining -= written
-                localOffset += written
-                currentOffset += Int64(written)
-            }
-        }
-    }
-
-    func flush() throws {
-        try lock.withLock {
-            try flushLocked()
-        }
-    }
-
-    private func flushLocked() throws {
-        guard !pendingBuffers.isEmpty else { return }
-
-        let bufferCount = pendingBuffers.count
-        var iovecs = [iovec](repeating: iovec(), count: bufferCount)
-
-        _ = pendingBuffers.withContiguousStorageIfAvailable { bufferPtrs in
-            for i in 0..<bufferCount {
-                bufferPtrs[i].withUnsafeBytes { rawBuffer in
-                    guard let baseAddress = rawBuffer.baseAddress else { return }
-                    iovecs[i] = iovec(
-                        iov_base: UnsafeMutableRawPointer(mutating: baseAddress),
-                        iov_len: rawBuffer.count
-                    )
-                }
-            }
-        }
-
-        if iovecs.contains(where: { $0.iov_base == nil }) {
-            for i in 0..<bufferCount {
-                pendingBuffers[i].withUnsafeBytes { rawBuffer in
-                    guard let baseAddress = rawBuffer.baseAddress else { return }
-                    iovecs[i] = iovec(
-                        iov_base: UnsafeMutableRawPointer(mutating: baseAddress),
-                        iov_len: rawBuffer.count
-                    )
-                }
-            }
-        }
-
-        try writevAll(fd: fd, iovecs: &iovecs)
-
-        let bytesWritten = pendingSize
-        currentOffset += Int64(bytesWritten)
-        pendingBuffers.removeAll(keepingCapacity: true)
-        pendingSize = 0
-    }
-
-    private func writevAll(fd: Int32, iovecs: inout [iovec]) throws {
-        var remaining = iovecs.count
-        var startIndex = 0
-
-        while remaining > 0 {
-            let count = min(remaining, Int(IOV_MAX))
-            let written = iovecs.withUnsafeMutableBufferPointer { ptr in
-                Darwin.writev(fd, ptr.baseAddress! + startIndex, Int32(count))
-            }
-
-            if written < 0 {
-                let err = errno
-                if err == EINTR {
-                    continue
-                }
-                throw POSIXError(POSIXError.Code(rawValue: err) ?? .EIO)
-            }
-
-            var bytesWritten = written
-            while bytesWritten > 0 && startIndex < iovecs.count {
-                let currentLen = iovecs[startIndex].iov_len
-                if bytesWritten >= currentLen {
-                    bytesWritten -= currentLen
-                    startIndex += 1
-                    remaining -= 1
-                } else {
-                    iovecs[startIndex].iov_base = iovecs[startIndex].iov_base?.advanced(by: Int(bytesWritten))
-                    iovecs[startIndex].iov_len -= Int(bytesWritten)
-                    bytesWritten = 0
-                }
-            }
-        }
-    }
-
-    func close() async throws {
-        try flush()
         if Darwin.close(fd) != 0 {
             throw POSIXError(POSIXError.Code(rawValue: errno) ?? .EIO)
         }
