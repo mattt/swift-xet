@@ -175,17 +175,23 @@ public final class XetDownloader: @unchecked Sendable {
         #else
             let effectiveEnableMultipath = false
         #endif
-        let httpConfiguration = HTTPClient.Configuration(
-            xet: .init(
-                connectionsPerHost: configuration.connectionsPerHost,
-                prewarmedConnections: configuration.prewarmedConnections,
-                connectTimeout: configuration.connectTimeout,
-                readTimeout: configuration.readTimeout,
-                waitsForConnectivity: configuration.waitsForConnectivity,
-                idleTimeout: configuration.idleTimeout,
-                enableMultipath: effectiveEnableMultipath
-            )
+        var httpConfiguration = HTTPClient.Configuration()
+        httpConfiguration.httpVersion = .http1Only
+        httpConfiguration.timeout = .init(
+            connect: .seconds(Int64(configuration.connectTimeout)),
+            read: .seconds(Int64(configuration.readTimeout))
         )
+        httpConfiguration.connectionPool.concurrentHTTP1ConnectionsPerHostSoftLimit = max(
+            1,
+            configuration.connectionsPerHost
+        )
+        httpConfiguration.connectionPool.idleTimeout = .seconds(Int64(max(1, configuration.idleTimeout)))
+        httpConfiguration.connectionPool.preWarmedHTTP1ConnectionCount = max(
+            0,
+            min(configuration.prewarmedConnections, configuration.connectionsPerHost)
+        )
+        httpConfiguration.networkFrameworkWaitForConnectivity = configuration.waitsForConnectivity
+        httpConfiguration.enableMultipath = effectiveEnableMultipath
         self.httpClientPool = HTTPClientPool(
             configuration: httpConfiguration,
             size: configuration.poolSize
@@ -1061,38 +1067,6 @@ extension XetDownloader {
 }
 
 // MARK: - Private Helpers
-
-fileprivate struct XetHTTPClientConfiguration {
-    let connectionsPerHost: Int
-    let prewarmedConnections: Int
-    let connectTimeout: TimeInterval
-    let readTimeout: TimeInterval
-    let waitsForConnectivity: Bool
-    let idleTimeout: TimeInterval
-    let enableMultipath: Bool
-}
-
-extension HTTPClient.Configuration {
-    fileprivate init(xet configuration: XetHTTPClientConfiguration) {
-        self = HTTPClient.Configuration()
-        httpVersion = .http1Only
-        timeout = .init(
-            connect: .seconds(Int64(configuration.connectTimeout)),
-            read: .seconds(Int64(configuration.readTimeout))
-        )
-        connectionPool.concurrentHTTP1ConnectionsPerHostSoftLimit = max(
-            1,
-            configuration.connectionsPerHost
-        )
-        connectionPool.idleTimeout = .seconds(Int64(max(1, configuration.idleTimeout)))
-        connectionPool.preWarmedHTTP1ConnectionCount = max(
-            0,
-            min(configuration.prewarmedConnections, configuration.connectionsPerHost)
-        )
-        networkFrameworkWaitForConnectivity = configuration.waitsForConnectivity
-        enableMultipath = configuration.enableMultipath
-    }
-}
 
 /// Key for tracking which fetch ranges have been downloaded.
 private struct FetchRangeKey: Hashable {
