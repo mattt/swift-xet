@@ -200,10 +200,12 @@ public final class XetDownloader: @unchecked Sendable {
 
     /// Best-effort fallback cleanup.
     ///
-    /// Callers should explicitly shut down the downloader (for example,
-    /// via `Xet.withDownloader` or by invoking `shutdown()`) to ensure
-    /// deterministic resource cleanup. This `deinit` only attempts to
-    /// shut down the underlying HTTP client pool and logs any failure.
+    /// Callers should explicitly shut down the downloader
+    /// (for example, via `Xet.withDownloader` or by invoking `shutdown()`)
+    /// to ensure deterministic resource cleanup.
+    /// This `deinit` only attempts to
+    /// shut down the underlying HTTP client pool and event loop group
+    /// and logs any failure.
     deinit {
         let pool = httpClientPool
         Task.detached {
