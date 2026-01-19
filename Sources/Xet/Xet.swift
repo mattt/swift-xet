@@ -1,8 +1,13 @@
 import AsyncHTTPClient
 import Darwin
 import Foundation
+import NIOConcurrencyHelpers
 import NIOCore
 import NIOHTTP1
+import NIOPosix
+#if canImport(NIOTransportServices)
+    import NIOTransportServices
+#endif
 
 /// Namespace for Xet download helpers.
 ///
@@ -29,7 +34,7 @@ import NIOHTTP1
 ///     refreshURL: tokenURL,
 ///     hubToken: "hf_..."
 /// ) { downloader in
-///     try await downloader.download(for: fileID, to: destinationURL)
+///     try await downloader.download(fileID, to: destinationURL)
 /// }
 /// ```
 ///
@@ -95,19 +100,12 @@ public final class XetDownloader: @unchecked Sendable {
     private let maxInflightBuffers: Int
 
     /// Whether to allow insecure (non-HTTPS) connections.
-    ///
-    /// By default, the downloader requires HTTPS for all CAS and fetch URLs.
-    /// Set this to `true` only for local development or testing with
-    /// non-production servers.
-    ///
-    /// - Warning: Enabling insecure connections in production is a security risk.
-    ///   Tokens and file contents may be transmitted in plaintext.
-    public var allowsInsecureConnections: Bool = false
+    private let allowsInsecureConnections: Bool
 
     /// Configuration for tuning downloader performance.
     public struct Configuration: Sendable {
-        /// Maximum number of xorb fetches running at once. Defaults to 64.
-        public var maxConcurrentFetches: Int = 64
+        /// Maximum number of xorb fetches running at once. Defaults to 100.
+        public var maxConcurrentFetches: Int = 100
 
         /// Maximum number of chunk decode operations running at once.
         /// Defaults to the active processor count.
@@ -119,14 +117,14 @@ public final class XetDownloader: @unchecked Sendable {
         /// Maximum number of decoded buffers held in memory. Defaults to 16.
         public var maxInflightBuffers: Int = 16
 
-        /// Maximum concurrent HTTP/1 connections per host. Defaults to 32.
-        public var connectionsPerHost: Int = 32
+        /// Maximum concurrent HTTP/1 connections per host. Defaults to 24.
+        public var connectionsPerHost: Int = 24
 
         /// Number of prewarmed HTTP/1 connections per host. Defaults to 16.
         public var prewarmedConnections: Int = 16
 
-        /// Number of HTTP clients in the pool. Defaults to 1.
-        public var poolSize: Int = 1
+        /// Number of HTTP clients in the pool. Defaults to 4.
+        public var poolSize: Int = 4
 
         /// Connection timeout for HTTP requests, in seconds. Defaults to 60.
         public var connectTimeout: TimeInterval = 60
@@ -144,6 +142,22 @@ public final class XetDownloader: @unchecked Sendable {
 
         /// Idle timeout for pooled connections, in seconds. Defaults to 120.
         public var idleTimeout: TimeInterval = 120
+
+        /// Whether to enable multipath connections. Defaults to true.
+        ///
+        /// Some environments or network stacks may not support multipath and can
+        /// surface "Operation unsupported" connection failures if enabled.
+        public var enableMultipath: Bool = true
+
+        /// Whether to allow insecure (non-HTTPS) connections.
+        ///
+        /// By default, the downloader requires HTTPS for all CAS and fetch URLs.
+        /// Set this to `true` only for local development or testing with
+        /// non-production servers.
+        ///
+        /// - Warning: Enabling insecure connections in production is a security risk.
+        ///   Tokens and file contents may be transmitted in plaintext.
+        public var allowsInsecureConnections: Bool = false
 
         public static let `default` = Configuration()
     }
@@ -168,6 +182,11 @@ public final class XetDownloader: @unchecked Sendable {
         )
         self.casClient = CASClient(urlSession: .shared)
         let effectiveMaxConcurrentFetches = max(1, configuration.maxConcurrentFetches)
+        #if canImport(NIOTransportServices)
+            let effectiveEnableMultipath = configuration.enableMultipath
+        #else
+            let effectiveEnableMultipath = false
+        #endif
         let httpConfiguration = HTTPClient.Configuration(
             xet: .init(
                 connectionsPerHost: configuration.connectionsPerHost,
@@ -175,7 +194,8 @@ public final class XetDownloader: @unchecked Sendable {
                 connectTimeout: configuration.connectTimeout,
                 readTimeout: configuration.readTimeout,
                 waitsForConnectivity: configuration.waitsForConnectivity,
-                idleTimeout: configuration.idleTimeout
+                idleTimeout: configuration.idleTimeout,
+                enableMultipath: effectiveEnableMultipath
             )
         )
         self.httpClientPool = HTTPClientPool(
@@ -192,6 +212,7 @@ public final class XetDownloader: @unchecked Sendable {
         self.httpClientRequestTimeout = .seconds(Int64(max(1, configuration.readTimeout)))
         self.maxConcurrentDecodes = max(1, configuration.maxConcurrentDecodes)
         self.maxInflightBuffers = max(1, configuration.maxInflightBuffers)
+        self.allowsInsecureConnections = configuration.allowsInsecureConnections
     }
 
     deinit {
@@ -284,7 +305,9 @@ public final class XetDownloader: @unchecked Sendable {
             try await target.closeIfNeeded()
             return written
         } catch {
-            await target.closeIfNeeded(catching: { _ in })
+            await target.closeIfNeeded(catching: { closeError in
+                fputs("Xet: failed to close file after download error: \(closeError)\n", stderr)
+            })
             throw error
         }
     }
@@ -474,13 +497,19 @@ public final class XetDownloader: @unchecked Sendable {
 
             inflightFetches[key] = Task {
                 await fetchSemaphore.wait()
-                defer { Task { await fetchSemaphore.signal() } }
-                return try await fetchXorbChunks(
-                    termHash: term.hash,
-                    fetchInfo: context.fetchInfo,
-                    request: context.request,
-                    expectedUnpackedLength: expectedUnpackedLength
-                )
+                do {
+                    let fetched = try await fetchXorbChunks(
+                        termHash: term.hash,
+                        fetchInfo: context.fetchInfo,
+                        request: context.request,
+                        expectedUnpackedLength: expectedUnpackedLength
+                    )
+                    await fetchSemaphore.signal()
+                    return fetched
+                } catch {
+                    await fetchSemaphore.signal()
+                    throw error
+                }
             }
         }
 
@@ -635,6 +664,10 @@ public final class XetDownloader: @unchecked Sendable {
             byteCount: totalOutputSize,
             alignment: 16
         )
+        var outputBufferToFree: UnsafeMutableRawPointer? = outputBuffer
+        defer {
+            outputBufferToFree?.deallocate()
+        }
 
         var cursor = ByteCursor()
         var chunkByteIndices: [Int] = [0]
@@ -712,7 +745,6 @@ public final class XetDownloader: @unchecked Sendable {
                 throw XorbError.truncatedStream
             }
         } catch {
-            outputBuffer.deallocate()
             throw error
         }
 
@@ -721,6 +753,7 @@ public final class XetDownloader: @unchecked Sendable {
             count: writeOffset,
             deallocator: .custom { ptr, _ in ptr.deallocate() }
         )
+        outputBufferToFree = nil
         return (data: data, chunkByteIndices: chunkByteIndices)
     }
 
@@ -770,6 +803,8 @@ private actor AsyncSemaphore {
 private actor HTTPClientPool {
     /// Shared HTTP client instances.
     private let clients: [HTTPClient]
+    /// Shared event loop group for all clients.
+    private let eventLoopGroup: EventLoopGroup
     /// Next client index for round-robin selection.
     private var nextIndex = 0
 
@@ -778,15 +813,26 @@ private actor HTTPClientPool {
         let poolSize = max(1, size)
         var created: [HTTPClient] = []
         created.reserveCapacity(poolSize)
+        let group: EventLoopGroup
+        #if canImport(NIOTransportServices)
+            if configuration.enableMultipath {
+                group = NIOTSEventLoopGroup(loopCount: System.coreCount)
+            } else {
+                group = MultiThreadedEventLoopGroup(numberOfThreads: System.coreCount)
+            }
+        #else
+            group = MultiThreadedEventLoopGroup(numberOfThreads: System.coreCount)
+        #endif
         for _ in 0 ..< poolSize {
             created.append(
                 HTTPClient(
-                    eventLoopGroupProvider: .singleton,
+                    eventLoopGroupProvider: .shared(group),
                     configuration: configuration
                 )
             )
         }
         self.clients = created
+        self.eventLoopGroup = group
     }
 
     /// Returns the next client in the pool.
@@ -806,6 +852,15 @@ private actor HTTPClientPool {
                     } else {
                         continuation.resume()
                     }
+                }
+            }
+        }
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            eventLoopGroup.shutdownGracefully { error in
+                if let error {
+                    continuation.resume(throwing: error)
+                } else {
+                    continuation.resume()
                 }
             }
         }
@@ -1022,6 +1077,7 @@ fileprivate struct XetHTTPClientConfiguration {
     let readTimeout: TimeInterval
     let waitsForConnectivity: Bool
     let idleTimeout: TimeInterval
+    let enableMultipath: Bool
 }
 
 extension HTTPClient.Configuration {
@@ -1042,7 +1098,7 @@ extension HTTPClient.Configuration {
             min(configuration.prewarmedConnections, configuration.connectionsPerHost)
         )
         networkFrameworkWaitForConnectivity = configuration.waitsForConnectivity
-        enableMultipath = true
+        enableMultipath = configuration.enableMultipath
     }
 }
 
@@ -1125,7 +1181,8 @@ actor DataOutputWriter {
 
 /// A random access output writer backed by POSIX pwrite.
 final class FileOutputWriter: @unchecked Sendable {
-    private let fd: Int32
+    private let lock = NIOLock()
+    private var fd: Int32
     private var sequentialOffset: Int64 = 0
 
     init(destinationURL: URL) throws {
@@ -1150,12 +1207,16 @@ final class FileOutputWriter: @unchecked Sendable {
         guard let baseAddress = buffer.baseAddress else {
             return
         }
+        let currentFD = lock.withLock { fd }
+        guard currentFD >= 0 else {
+            throw POSIXError(.EBADF)
+        }
         var bytesRemaining = buffer.count
         var localOffset = 0
         while bytesRemaining > 0 {
             let writeSize = bytesRemaining
             let written = pwrite(
-                fd,
+                currentFD,
                 baseAddress.advanced(by: localOffset),
                 writeSize,
                 off_t(offset + Int64(localOffset))
@@ -1169,15 +1230,26 @@ final class FileOutputWriter: @unchecked Sendable {
     }
 
     func write(_ data: Data) async throws {
-        let offset = sequentialOffset
+        let offset = lock.withLock {
+            let offset = sequentialOffset
+            sequentialOffset += Int64(data.count)
+            return offset
+        }
         try data.withUnsafeBytes { rawBuffer in
             try write(contentsOf: rawBuffer, at: offset)
         }
-        sequentialOffset += Int64(data.count)
     }
 
     func close() async throws {
-        if Darwin.close(fd) != 0 {
+        let currentFD = lock.withLock {
+            let currentFD = fd
+            fd = -1
+            return currentFD
+        }
+        guard currentFD >= 0 else {
+            return
+        }
+        if Darwin.close(currentFD) != 0 {
             throw POSIXError(POSIXError.Code(rawValue: errno) ?? .EIO)
         }
     }

@@ -41,7 +41,7 @@ public enum Xorb {
     /// Decodes a contiguous xorb buffer into uncompressed chunks.
     ///
     /// - Parameter data: The complete xorb payload.
-    /// - Returns: All decoded chunk payloads in order.
+    /// - Returns: All decoded chunks as decompressed `Data`, in order.
     /// - Throws: ``XorbError`` if the stream is malformed.
     public static func decode(_ data: Data) throws -> [Data] {
         try data.withUnsafeBytes { raw in
@@ -52,11 +52,11 @@ public enum Xorb {
     /// Decodes a contiguous xorb buffer into uncompressed chunks.
     ///
     /// - Parameter bytes: The complete xorb payload.
-    /// - Returns: All decoded chunk payloads in order.
+    /// - Returns: All decoded chunks as decompressed `Data`, in order.
     /// - Throws: ``XorbError`` if the stream is malformed.
-    public static func decode(_ bytes: UnsafeRawBufferPointer) throws -> [Data] {
+    public static func decode(_ data: UnsafeRawBufferPointer) throws -> [Data] {
         var cursor = ByteCursor()
-        cursor.append(bytes)
+        cursor.append(data)
         var chunks: [Data] = []
         while true {
             if let chunk = try decodeNextChunk(from: &cursor) {

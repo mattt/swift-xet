@@ -54,7 +54,7 @@ public enum LZ4 {
     ) throws -> Data {
         guard uncompressedLength > 0 else { return Data() }
 
-        guard let dst = malloc(uncompressedLength) else {
+        guard let dst = calloc(uncompressedLength, 1) else {
             throw LZ4Error.decompressionFailed
         }
 
@@ -99,7 +99,10 @@ public enum LZ4 {
         }
 
         if isStandardFrame(compressed) {
-            let data = Data(bytes: compressed.baseAddress!, count: compressed.count)
+            guard let baseAddress = compressed.baseAddress else {
+                throw LZ4Error.decompressionFailed
+            }
+            let data = Data(bytes: baseAddress, count: compressed.count)
             let framed = try _decompressFrame(data, expectedSize: uncompressedLength)
             guard framed.count == uncompressedLength else {
                 throw LZ4Error.decompressionFailed
@@ -168,7 +171,7 @@ public enum LZ4 {
                     nil,
                     COMPRESSION_LZ4_RAW
                 )
-                if decodedCount > 0, decodedCount < maxOutputSize {
+                if decodedCount > 0, decodedCount <= maxOutputSize {
                     return decodedCount
                 }
             }
