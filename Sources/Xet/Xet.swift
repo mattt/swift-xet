@@ -87,20 +87,39 @@ public final class XetDownloader: @unchecked Sendable {
     /// Pool of HTTP clients for xorb fetches.
     private let httpClientPool: HTTPClientPool
 
+    /// Downloader configuration settings.
+    private let configuration: Configuration
+
     /// Cap on concurrent xorb fetch tasks.
-    private let maxConcurrentFetches: Int
+    private var maxConcurrentFetches: Int {
+        let effectiveMaxConcurrentFetches = max(1, configuration.maxConcurrentFetches)
+        if configuration.autoScaleFetchConcurrency {
+            let poolSize = max(1, configuration.poolSize)
+            let target = poolSize * max(1, configuration.connectionsPerHost)
+            return max(effectiveMaxConcurrentFetches, target)
+        }
+        return effectiveMaxConcurrentFetches
+    }
 
     /// Per-request timeout for xorb fetches.
-    private let httpClientRequestTimeout: TimeAmount
+    private var httpClientRequestTimeout: TimeAmount {
+        .seconds(Int64(max(1, configuration.readTimeout)))
+    }
 
     /// Cap on concurrent decode operations.
-    private let maxConcurrentDecodes: Int
+    private var maxConcurrentDecodes: Int {
+        max(1, configuration.maxConcurrentDecodes)
+    }
 
     /// Maximum in-flight buffers held during decoding.
-    private let maxInflightBuffers: Int
+    private var maxInflightBuffers: Int {
+        max(1, configuration.maxInflightBuffers)
+    }
 
     /// Whether to allow insecure (non-HTTPS) connections.
-    private let allowsInsecureConnections: Bool
+    private var allowsInsecureConnections: Bool {
+        configuration.allowsInsecureConnections
+    }
 
     /// Configuration for tuning downloader performance.
     public struct Configuration: Sendable {
@@ -177,11 +196,11 @@ public final class XetDownloader: @unchecked Sendable {
     ) {
         self.refreshURL = refreshURL
         self.hubToken = hubToken
+        self.configuration = configuration
         self.tokenProvider = TokenProvider(
             urlSession: .shared
         )
         self.casClient = CASClient(urlSession: .shared)
-        let effectiveMaxConcurrentFetches = max(1, configuration.maxConcurrentFetches)
         #if canImport(NIOTransportServices)
             let effectiveEnableMultipath = configuration.enableMultipath
         #else
@@ -202,17 +221,6 @@ public final class XetDownloader: @unchecked Sendable {
             configuration: httpConfiguration,
             size: configuration.poolSize
         )
-        if configuration.autoScaleFetchConcurrency {
-            let poolSize = max(1, configuration.poolSize)
-            let target = poolSize * max(1, configuration.connectionsPerHost)
-            self.maxConcurrentFetches = max(effectiveMaxConcurrentFetches, target)
-        } else {
-            self.maxConcurrentFetches = effectiveMaxConcurrentFetches
-        }
-        self.httpClientRequestTimeout = .seconds(Int64(max(1, configuration.readTimeout)))
-        self.maxConcurrentDecodes = max(1, configuration.maxConcurrentDecodes)
-        self.maxInflightBuffers = max(1, configuration.maxInflightBuffers)
-        self.allowsInsecureConnections = configuration.allowsInsecureConnections
     }
 
     deinit {
