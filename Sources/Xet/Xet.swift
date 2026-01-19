@@ -226,7 +226,11 @@ public final class XetDownloader: @unchecked Sendable {
                 case .alreadyShutdown:
                     break
                 default:
-                    fputs("XetDownloader deinit: failed to shutdown HTTP client pool: \(error)\n", stderr)
+                    if let data = "XetDownloader deinit: failed to shutdown HTTP client pool: \(error)\n".data(
+                        using: .utf8
+                    ) {
+                        FileHandle.standardError.write(data)
+                    }
                 }
             }
         }
@@ -299,7 +303,9 @@ public final class XetDownloader: @unchecked Sendable {
         if fileManager.fileExists(atPath: destinationURL.path) {
             try fileManager.removeItem(at: destinationURL)
         }
-        fileManager.createFile(atPath: destinationURL.path, contents: nil)
+        guard fileManager.createFile(atPath: destinationURL.path, contents: nil) else {
+            throw CocoaError(.fileWriteUnknown)
+        }
 
         if let byteRange, byteRange.isEmpty {
             return 0
@@ -316,7 +322,9 @@ public final class XetDownloader: @unchecked Sendable {
             return written
         } catch {
             await target.closeIfNeeded(catching: { closeError in
-                fputs("Xet: failed to close file after download error: \(closeError)\n", stderr)
+                if let data = "Xet: failed to close file after download error: \(closeError)\n".data(using: .utf8) {
+                    FileHandle.standardError.write(data)
+                }
             })
             throw error
         }
@@ -839,7 +847,7 @@ private actor HTTPClientPool {
         var created: [HTTPClient] = []
         created.reserveCapacity(poolSize)
         let group: EventLoopGroup
-        #if canImport(NIOTransportServices)
+        #if canImport(NIOTransportServices) && !os(Linux)
             if configuration.enableMultipath {
                 group = NIOTSEventLoopGroup(loopCount: System.coreCount)
             } else {
@@ -1241,7 +1249,14 @@ final class FileOutputWriter: @unchecked Sendable {
         guard currentFD >= 0 else {
             return
         }
-        if Darwin.close(currentFD) != 0 {
+        #if canImport(Darwin)
+            let closeResult = Darwin.close(currentFD)
+        #elseif canImport(Glibc)
+            let closeResult = Glibc.close(currentFD)
+        #else
+            let closeResult = -1
+        #endif
+        if closeResult != 0 {
             throw POSIXError(POSIXError.Code(rawValue: errno) ?? .EIO)
         }
     }
