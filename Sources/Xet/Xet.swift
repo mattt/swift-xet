@@ -204,15 +204,21 @@ public final class XetDownloader: @unchecked Sendable {
     /// (for example, via `Xet.withDownloader` or by invoking `shutdown()`)
     /// to ensure deterministic resource cleanup.
     /// This `deinit` only attempts to
-    /// shut down the underlying HTTP client pool and event loop group
-    /// and logs any failure.
+    /// shut down the underlying HTTP client pool and event loop group.
+    /// The `alreadyShutdown` error is silently ignored since it's expected
+    /// when shutdown was already called explicitly; other errors are logged.
     deinit {
         let pool = httpClientPool
         Task.detached {
             do {
                 try await pool.shutdown()
             } catch {
-                fputs("XetDownloader deinit: failed to shutdown HTTP client pool: \(error)\n", stderr)
+                switch error as? HTTPClientError {
+                case .alreadyShutdown:
+                    break
+                default:
+                    fputs("XetDownloader deinit: failed to shutdown HTTP client pool: \(error)\n", stderr)
+                }
             }
         }
     }
