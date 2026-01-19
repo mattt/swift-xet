@@ -92,8 +92,8 @@ public final class XetDownloader: @unchecked Sendable {
 
     /// Configuration for tuning downloader performance.
     public struct Configuration: Sendable {
-        /// Maximum number of xorb fetches running at once. Defaults to 100.
-        public var maxConcurrentFetches: Int = 100
+        /// Maximum number of xorb fetches running at once. Defaults to 128.
+        public var maxConcurrentFetches: Int = 128
 
         /// Maximum number of chunk decode operations running at once.
         /// Defaults to the active processor count.
