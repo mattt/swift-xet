@@ -171,7 +171,7 @@ public enum LZ4 {
                     nil,
                     COMPRESSION_LZ4_RAW
                 )
-                if decodedCount > 0, decodedCount <= maxOutputSize {
+                if decodedCount > 0, decodedCount < maxOutputSize {
                     return decodedCount
                 }
             }
