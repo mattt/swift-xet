@@ -90,37 +90,6 @@ public final class XetDownloader: @unchecked Sendable {
     /// Downloader configuration settings.
     private let configuration: Configuration
 
-    /// Cap on concurrent xorb fetch tasks.
-    private var maxConcurrentFetches: Int {
-        let effectiveMaxConcurrentFetches = max(1, configuration.maxConcurrentFetches)
-        if configuration.autoScaleFetchConcurrency {
-            let poolSize = max(1, configuration.poolSize)
-            let target = poolSize * max(1, configuration.connectionsPerHost)
-            return max(effectiveMaxConcurrentFetches, target)
-        }
-        return effectiveMaxConcurrentFetches
-    }
-
-    /// Per-request timeout for xorb fetches.
-    private var httpClientRequestTimeout: TimeAmount {
-        .seconds(Int64(max(1, configuration.readTimeout)))
-    }
-
-    /// Cap on concurrent decode operations.
-    private var maxConcurrentDecodes: Int {
-        max(1, configuration.maxConcurrentDecodes)
-    }
-
-    /// Maximum in-flight buffers held during decoding.
-    private var maxInflightBuffers: Int {
-        max(1, configuration.maxInflightBuffers)
-    }
-
-    /// Whether to allow insecure (non-HTTPS) connections.
-    private var allowsInsecureConnections: Bool {
-        configuration.allowsInsecureConnections
-    }
-
     /// Configuration for tuning downloader performance.
     public struct Configuration: Sendable {
         /// Maximum number of xorb fetches running at once. Defaults to 100.
@@ -353,7 +322,7 @@ public final class XetDownloader: @unchecked Sendable {
             hubToken: hubToken
         )
         // Validate CAS URL uses HTTPS unless insecure connections are allowed
-        if !allowsInsecureConnections && conn.casURL.scheme != "https" {
+        if !configuration.allowsInsecureConnections && conn.casURL.scheme != "https" {
             throw XetDownloaderError.insecureURL(conn.casURL)
         }
 
@@ -393,7 +362,7 @@ public final class XetDownloader: @unchecked Sendable {
                 throw XetDownloaderError.invalidFetchURL(fetchInfo.url)
             }
             // Validate fetch URL uses HTTPS unless insecure connections are allowed
-            if !allowsInsecureConnections && fetchURL.scheme != "https" {
+            if !configuration.allowsInsecureConnections && fetchURL.scheme != "https" {
                 throw XetDownloaderError.insecureURL(fetchURL)
             }
 
@@ -423,6 +392,15 @@ public final class XetDownloader: @unchecked Sendable {
 
         var totalWritten: Int64 = 0
         var writeOffset: Int64 = 0
+        let effectiveMaxConcurrentFetches = max(1, configuration.maxConcurrentFetches)
+        let maxConcurrentFetches: Int
+        if configuration.autoScaleFetchConcurrency {
+            let poolSize = max(1, configuration.poolSize)
+            let target = poolSize * max(1, configuration.connectionsPerHost)
+            maxConcurrentFetches = max(effectiveMaxConcurrentFetches, target)
+        } else {
+            maxConcurrentFetches = effectiveMaxConcurrentFetches
+        }
         let fetchSemaphore = AsyncSemaphore(maxConcurrentTasks: maxConcurrentFetches)
         var inflightFetches: [FetchRangeKey: Task<FetchedXorb, Error>] = [:]
         let writeRaw = target.writeContentsOf
@@ -576,13 +554,19 @@ public final class XetDownloader: @unchecked Sendable {
         }
         let response = try await client.execute(
             httpRequest,
-            timeout: httpClientRequestTimeout
+            timeout: .seconds(Int64(max(1, configuration.readTimeout)))
         )
         let statusCode = Int(response.status.code)
         guard (200 ..< 300).contains(statusCode) || statusCode == 206 else {
             throw XetDownloaderError.fetchFailed(statusCode: statusCode, url: url)
         }
-        let bufferSlots = max(2, min(maxInflightBuffers, maxConcurrentDecodes))
+        let bufferSlots = max(
+            2,
+            min(
+                max(1, configuration.maxInflightBuffers),
+                max(1, configuration.maxConcurrentDecodes)
+            )
+        )
         let bufferSemaphore = AsyncSemaphore(maxConcurrentTasks: bufferSlots)
         let stream = AsyncThrowingStream<ByteBuffer, Error> { continuation in
             let task = Task {
