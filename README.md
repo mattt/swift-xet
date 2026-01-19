@@ -19,7 +19,7 @@ that use Xet storage.
 ## Requirements
 
 - Swift 6.0+ / Xcode 16+
-- macOS 13+ / iOS 15+ / tvOS 15+ / watchOS 8+ / visionOS
+- macOS 13+ / iOS 15+ / tvOS 15+ / watchOS 8+ / visionOS / Linux
 
 ## Installation
 
