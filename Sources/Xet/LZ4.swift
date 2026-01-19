@@ -13,9 +13,11 @@ import Foundation
 ///
 /// The xorb format uses raw LZ4 blocks for chunk compression.
 ///
-/// - Note: Apple's Compression framework is not used here because it wraps LZ4 data
-///   in a proprietary framing format (magic bytes `0x62 0x76 0x34 0x31`) that is
-///   incompatible with both raw LZ4 blocks and the standard LZ4 frame format.
+/// On Apple platforms, raw block decompression uses the Compression framework's
+/// `COMPRESSION_LZ4_RAW` algorithm for optimal performance.
+/// A pure Swift fallback is used when Compression is unavailable
+/// or for edge cases requiring precise bounds checking.
+///
 /// - SeeAlso: [LZ4 Block Format](https://github.com/lz4/lz4/blob/dev/doc/lz4_Block_format.md)
 /// - SeeAlso: [LZ4 Frame Format](https://github.com/lz4/lz4/blob/dev/doc/lz4_Frame_format.md)
 public enum LZ4 {
@@ -58,7 +60,11 @@ public enum LZ4 {
             return framed.count
         }
 
-        return try decompressRawBlockInto(compressed, output: output)
+        let written = try decompressRawBlockInto(compressed, output: output)
+        guard written == uncompressedLength else {
+            throw LZ4Error.decompressionFailed
+        }
+        return written
     }
 
     /// Decompresses an LZ4 block with a known uncompressed size.
@@ -145,7 +151,7 @@ public enum LZ4 {
                     nil,
                     COMPRESSION_LZ4_RAW
                 )
-                if decodedCount > 0 {
+                if decodedCount > 0, decodedCount < maxOutputSize {
                     return decodedCount
                 }
             }
