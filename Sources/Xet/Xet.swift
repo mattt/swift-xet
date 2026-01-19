@@ -198,10 +198,20 @@ public final class XetDownloader: @unchecked Sendable {
         )
     }
 
+    /// Best-effort fallback cleanup.
+    ///
+    /// Callers should explicitly shut down the downloader (for example,
+    /// via `Xet.withDownloader` or by invoking `shutdown()`) to ensure
+    /// deterministic resource cleanup. This `deinit` only attempts to
+    /// shut down the underlying HTTP client pool and logs any failure.
     deinit {
         let pool = httpClientPool
-        Task {
-            try? await pool.shutdown()
+        Task.detached {
+            do {
+                try await pool.shutdown()
+            } catch {
+                fputs("XetDownloader deinit: failed to shutdown HTTP client pool: \(error)\n", stderr)
+            }
         }
     }
 
@@ -1156,7 +1166,6 @@ final class FileOutputWriter: @unchecked Sendable {
         if fm.fileExists(atPath: destinationURL.path) {
             try fm.removeItem(at: destinationURL)
         }
-        fm.createFile(atPath: destinationURL.path, contents: nil)
         let flags = O_CREAT | O_RDWR | O_TRUNC
         let mode: mode_t = S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH
         let fd = open(destinationURL.path, flags, mode)

@@ -51,12 +51,12 @@ public enum Xorb {
 
     /// Decodes a contiguous xorb buffer into uncompressed chunks.
     ///
-    /// - Parameter bytes: The complete xorb payload.
+    /// - Parameter buffer: The complete xorb payload.
     /// - Returns: All decoded chunks as decompressed `Data`, in order.
     /// - Throws: ``XorbError`` if the stream is malformed.
-    public static func decode(_ data: UnsafeRawBufferPointer) throws -> [Data] {
+    public static func decode(_ buffer: UnsafeRawBufferPointer) throws -> [Data] {
         var cursor = ByteCursor()
-        cursor.append(data)
+        cursor.append(contentsOf: buffer)
         var chunks: [Data] = []
         while true {
             if let chunk = try decodeNextChunk(from: &cursor) {
@@ -355,7 +355,13 @@ extension XorbError: LocalizedError {
 /// Provides efficient streaming reads without repeatedly copying data.
 /// The buffer compacts itself when the consumed prefix grows large.
 struct ByteCursor {
+    /// Minimum consumed bytes before attempting compaction.
+    private static let compactThreshold = 4096
+
+    /// The buffer to store the bytes.
     private var buffer = Data()
+
+    /// The index of the first unread byte.
     private var startIndex: Int = 0
 
     /// The number of unread bytes in the buffer.
@@ -382,8 +388,8 @@ struct ByteCursor {
     }
 
     /// Appends raw bytes to the buffer.
-    mutating func append(_ bytes: UnsafeRawBufferPointer) {
-        let typed = bytes.bindMemory(to: UInt8.self)
+    mutating func append(contentsOf source: UnsafeRawBufferPointer) {
+        let typed = source.bindMemory(to: UInt8.self)
         buffer.append(contentsOf: typed)
     }
 
@@ -437,7 +443,9 @@ struct ByteCursor {
             return
         }
 
-        if startIndex > 4096, startIndex * 2 > buffer.count {
+        if startIndex > Self.compactThreshold,
+            startIndex * 2 > buffer.count
+        {
             buffer.removeSubrange(0 ..< startIndex)
             startIndex = 0
         }

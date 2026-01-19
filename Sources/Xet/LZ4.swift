@@ -171,6 +171,10 @@ public enum LZ4 {
                     nil,
                     COMPRESSION_LZ4_RAW
                 )
+                // Keep this strict (< maxOutputSize).
+                // Relaxing it to <= would require extra validation in the fast path,
+                // which defeats the performance advantage.
+                // Exact-sized outputs fall back safely.
                 if decodedCount > 0, decodedCount < maxOutputSize {
                     return decodedCount
                 }
