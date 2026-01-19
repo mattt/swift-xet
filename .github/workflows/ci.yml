@@ -16,6 +16,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - swift: "6.0"
+            xcode: "16.0"
+            macos: "15"
           - swift: "6.1"
             xcode: "16.3"
             macos: "15"
@@ -25,10 +28,10 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Cache Swift Package Manager dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cache/org.swift.swiftpm
@@ -36,6 +39,32 @@ jobs:
           key: ${{ runner.os }}-swift-${{ matrix.swift }}-spm-${{ hashFiles('**/Package.resolved') }}
           restore-keys: |
             ${{ runner.os }}-swift-${{ matrix.swift }}-spm-
+
+      - name: Build
+        run: swift build -v
+
+      - name: Test
+        run: swift test -v
+
+  test-linux:
+    name: Swift ${{ matrix.swift-version }} on Linux
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        swift-version:
+          - "6.0.3"
+          - "6.1.3"
+          - "6.2.3"
+    timeout-minutes: 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Setup Swift
+        uses: vapor/swiftly-action@v0.2
+        with:
+          toolchain: ${{ matrix.swift-version }}
 
       - name: Build
         run: swift build -v
