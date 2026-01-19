@@ -19,6 +19,48 @@ import Foundation
 /// - SeeAlso: [LZ4 Block Format](https://github.com/lz4/lz4/blob/dev/doc/lz4_Block_format.md)
 /// - SeeAlso: [LZ4 Frame Format](https://github.com/lz4/lz4/blob/dev/doc/lz4_Frame_format.md)
 public enum LZ4 {
+
+    // MARK: - Public API
+
+    /// Decompresses an LZ4 block into a pre-allocated output buffer.
+    ///
+    /// This is the primary decompression method. Automatically detects whether
+    /// the input is a raw block or a standard frame by checking for the frame magic number.
+    ///
+    /// - Parameters:
+    ///   - compressed: The compressed data as an unsafe buffer pointer.
+    ///   - uncompressedLength: The expected size after decompression.
+    ///   - output: Pre-allocated output buffer (must be >= uncompressedLength).
+    ///
+    /// - Returns: The number of bytes written to output.
+    /// - Throws: ``LZ4Error`` if decompression fails.
+    public static func decompressBlockInto(
+        _ compressed: UnsafeRawBufferPointer,
+        uncompressedLength: Int,
+        output: UnsafeMutableRawBufferPointer
+    ) throws -> Int {
+        guard uncompressedLength > 0 else { return 0 }
+        guard output.count >= uncompressedLength else {
+            throw LZ4Error.decompressionFailed
+        }
+
+        if isStandardFrame(compressed) {
+            let data = Data(bytes: compressed.baseAddress!, count: compressed.count)
+            let framed = try decompressStandardFrame(data, expectedSize: uncompressedLength)
+            guard framed.count == uncompressedLength else {
+                throw LZ4Error.decompressionFailed
+            }
+            framed.withUnsafeBytes { src in
+                if let srcBase = src.baseAddress, let dstBase = output.baseAddress {
+                    memcpy(dstBase, srcBase, framed.count)
+                }
+            }
+            return framed.count
+        }
+
+        return try decompressRawBlockInto(compressed, output: output)
+    }
+
     /// Decompresses an LZ4 block with a known uncompressed size.
     ///
     /// Automatically detects whether the input is a raw block
@@ -29,100 +71,163 @@ public enum LZ4 {
     ///   - uncompressedLength: The expected size after decompression.
     ///
     /// - Returns: The decompressed data.
-    ///
     /// - Throws: ``LZ4Error`` if decompression fails or size doesn't match.
     public static func decompressBlock(_ compressed: Data, uncompressedLength: Int) throws -> Data {
-        precondition(uncompressedLength >= 0)
-        if uncompressedLength == 0 {
-            return Data()
-        }
+        guard uncompressedLength > 0 else { return Data() }
 
-        if compressed.count >= 4,
-            compressed[compressed.startIndex] == 0x04,
-            compressed[compressed.startIndex.advanced(by: 1)] == 0x22,
-            compressed[compressed.startIndex.advanced(by: 2)] == 0x4D,
-            compressed[compressed.startIndex.advanced(by: 3)] == 0x18
-        {
-            let framed = try decompressStandardFrame(compressed, expectedSize: uncompressedLength)
-            guard framed.count == uncompressedLength else { throw LZ4Error.decompressionFailed }
-            return framed
+        return try compressed.withUnsafeBytes { srcBuffer in
+            try decompressBlock(srcBuffer, uncompressedLength: uncompressedLength)
         }
-
-        let raw = try decompressRawBlock(compressed, maxOutputSize: uncompressedLength)
-        guard raw.count == uncompressedLength else { throw LZ4Error.decompressionFailed }
-        return raw
     }
 
+    /// Decompresses an LZ4 block with a known uncompressed size.
+    ///
+    /// - Parameters:
+    ///   - compressed: The compressed data as an unsafe buffer pointer.
+    ///   - uncompressedLength: The expected size after decompression.
+    ///
+    /// - Returns: The decompressed data.
+    /// - Throws: ``LZ4Error`` if decompression fails or size doesn't match.
     public static func decompressBlock(
         _ compressed: UnsafeRawBufferPointer,
         uncompressedLength: Int
     ) throws -> Data {
-        precondition(uncompressedLength >= 0)
-        if uncompressedLength == 0 {
-            return Data()
+        guard uncompressedLength > 0 else { return Data() }
+
+        guard let dst = malloc(uncompressedLength) else {
+            throw LZ4Error.decompressionFailed
         }
 
-        if compressed.count >= 4,
-            let base = compressed.bindMemory(to: UInt8.self).baseAddress,
-            base[0] == 0x04,
-            base[1] == 0x22,
-            base[2] == 0x4D,
-            base[3] == 0x18
-        {
-            let data = Data(bytes: base, count: compressed.count)
-            let framed = try decompressStandardFrame(data, expectedSize: uncompressedLength)
-            guard framed.count == uncompressedLength else { throw LZ4Error.decompressionFailed }
-            return framed
+        do {
+            let output = UnsafeMutableRawBufferPointer(start: dst, count: uncompressedLength)
+            let written = try decompressBlockInto(compressed, uncompressedLength: uncompressedLength, output: output)
+            guard written == uncompressedLength else {
+                free(dst)
+                throw LZ4Error.decompressionFailed
+            }
+            return Data(bytesNoCopy: dst, count: uncompressedLength, deallocator: .free)
+        } catch {
+            free(dst)
+            throw error
         }
-
-        let raw = try decompressRawBlock(compressed, maxOutputSize: uncompressedLength)
-        guard raw.count == uncompressedLength else { throw LZ4Error.decompressionFailed }
-        return raw
     }
 
-    // MARK: - Raw LZ4 Block Decoding
+    // MARK: - Raw Block Decompression
 
-    /// Decompresses a raw LZ4 block without frame headers.
+    /// Decompresses a raw LZ4 block into a pre-allocated output buffer.
     ///
-    /// The raw block format consists of a sequence of tokens,
-    /// each containing literal bytes followed by a match copy operation.
+    /// This is the core decompression routine. Uses Apple's Compression framework
+    /// when available for optimal performance.
     ///
     /// - Parameters:
     ///   - compressed: The raw compressed block data.
-    ///   - maxOutputSize: Maximum bytes to decompress (prevents runaway).
+    ///   - output: Pre-allocated output buffer.
     ///
-    /// - Returns: The decompressed data.
-    ///
-    /// - Throws: ``LZ4Error/invalidFrame`` if the block is malformed.
-    public static func decompressRawBlock(_ compressed: Data, maxOutputSize: Int) throws -> Data {
-        if maxOutputSize == 0 { return Data() }
+    /// - Returns: The number of bytes written to output.
+    /// - Throws: ``LZ4Error`` if decompression fails.
+    public static func decompressRawBlockInto(
+        _ compressed: UnsafeRawBufferPointer,
+        output: UnsafeMutableRawBufferPointer
+    ) throws -> Int {
+        let maxOutputSize = output.count
+        guard maxOutputSize > 0 else { return 0 }
 
         #if canImport(Compression)
-            if !compressed.isEmpty {
-                guard let dst = malloc(maxOutputSize) else {
-                    throw LZ4Error.decompressionFailed
-                }
-                let decodedCount = compressed.withUnsafeBytes { srcBuffer -> Int in
-                    guard let srcBase = srcBuffer.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
-                        return 0
-                    }
-                    return compression_decode_buffer(
-                        dst.assumingMemoryBound(to: UInt8.self),
-                        maxOutputSize,
-                        srcBase,
-                        compressed.count,
-                        nil,
-                        COMPRESSION_LZ4_RAW
-                    )
-                }
+            if compressed.count > 0,
+                let srcBase = compressed.bindMemory(to: UInt8.self).baseAddress,
+                let dstBase = output.baseAddress?.assumingMemoryBound(to: UInt8.self)
+            {
+                let decodedCount = compression_decode_buffer(
+                    dstBase,
+                    maxOutputSize,
+                    srcBase,
+                    compressed.count,
+                    nil,
+                    COMPRESSION_LZ4_RAW
+                )
                 if decodedCount > 0 {
-                    return Data(bytesNoCopy: dst, count: decodedCount, deallocator: .free)
+                    return decodedCount
                 }
-                free(dst)
             }
         #endif
 
-        let src = [UInt8](compressed)
+        let decompressed = try decompressRawBlockSoftware(compressed, maxOutputSize: maxOutputSize)
+        guard decompressed.count <= maxOutputSize else {
+            throw LZ4Error.decompressionFailed
+        }
+        decompressed.withUnsafeBytes { src in
+            if let srcBase = src.baseAddress, let dstBase = output.baseAddress {
+                memcpy(dstBase, srcBase, decompressed.count)
+            }
+        }
+        return decompressed.count
+    }
+
+    /// Decompresses a raw LZ4 block without frame headers.
+    ///
+    /// - Parameters:
+    ///   - compressed: The raw compressed block data.
+    ///   - maxOutputSize: Maximum bytes to decompress.
+    ///
+    /// - Returns: The decompressed data.
+    /// - Throws: ``LZ4Error`` if decompression fails.
+    public static func decompressRawBlock(
+        _ compressed: UnsafeRawBufferPointer,
+        maxOutputSize: Int
+    ) throws -> Data {
+        guard maxOutputSize > 0 else { return Data() }
+
+        guard let dst = malloc(maxOutputSize) else {
+            throw LZ4Error.decompressionFailed
+        }
+
+        do {
+            let output = UnsafeMutableRawBufferPointer(start: dst, count: maxOutputSize)
+            let written = try decompressRawBlockInto(compressed, output: output)
+            return Data(bytesNoCopy: dst, count: written, deallocator: .free)
+        } catch {
+            free(dst)
+            throw error
+        }
+    }
+
+    /// Decompresses a raw LZ4 block without frame headers.
+    ///
+    /// - Parameters:
+    ///   - compressed: The raw compressed block data.
+    ///   - maxOutputSize: Maximum bytes to decompress.
+    ///
+    /// - Returns: The decompressed data.
+    /// - Throws: ``LZ4Error`` if decompression fails.
+    public static func decompressRawBlock(_ compressed: Data, maxOutputSize: Int) throws -> Data {
+        guard maxOutputSize > 0 else { return Data() }
+
+        return try compressed.withUnsafeBytes { srcBuffer in
+            try decompressRawBlock(srcBuffer, maxOutputSize: maxOutputSize)
+        }
+    }
+
+    // MARK: - Private Helpers
+
+    /// Checks if the buffer starts with the standard LZ4 frame magic number.
+    private static func isStandardFrame(_ buffer: UnsafeRawBufferPointer) -> Bool {
+        guard buffer.count >= 4,
+            let base = buffer.bindMemory(to: UInt8.self).baseAddress
+        else { return false }
+        return base[0] == 0x04 && base[1] == 0x22 && base[2] == 0x4D && base[3] == 0x18
+    }
+
+    /// Pure Swift implementation of raw LZ4 block decompression.
+    /// Used as fallback when Compression framework is unavailable or fails.
+    private static func decompressRawBlockSoftware(
+        _ compressed: UnsafeRawBufferPointer,
+        maxOutputSize: Int
+    ) throws -> Data {
+        guard compressed.count > 0, let base = compressed.baseAddress else {
+            return Data()
+        }
+
+        let src = UnsafeBufferPointer(start: base.assumingMemoryBound(to: UInt8.self), count: compressed.count)
         var i = 0
 
         func need(_ n: Int) throws {
@@ -180,128 +285,7 @@ public enum LZ4 {
         return Data(out)
     }
 
-    public static func decompressRawBlock(
-        _ compressed: UnsafeRawBufferPointer,
-        maxOutputSize: Int
-    ) throws -> Data {
-        if maxOutputSize == 0 { return Data() }
-
-        #if canImport(Compression)
-            if compressed.count > 0, let base = compressed.bindMemory(to: UInt8.self).baseAddress {
-                guard let dst = malloc(maxOutputSize) else {
-                    throw LZ4Error.decompressionFailed
-                }
-                let decodedCount = compression_decode_buffer(
-                    dst.assumingMemoryBound(to: UInt8.self),
-                    maxOutputSize,
-                    base,
-                    compressed.count,
-                    nil,
-                    COMPRESSION_LZ4_RAW
-                )
-                if decodedCount > 0 {
-                    return Data(bytesNoCopy: dst, count: decodedCount, deallocator: .free)
-                }
-                free(dst)
-            }
-        #endif
-
-        let data: Data
-        if let base = compressed.baseAddress, compressed.count > 0 {
-            data = Data(bytes: base, count: compressed.count)
-        } else {
-            data = Data()
-        }
-        return try decompressRawBlock(data, maxOutputSize: maxOutputSize)
-    }
-
-    public static func decompressRawBlockInto(
-        _ compressed: UnsafeRawBufferPointer,
-        output: UnsafeMutableRawBufferPointer
-    ) throws -> Int {
-        let maxOutputSize = output.count
-        if maxOutputSize == 0 { return 0 }
-
-        #if canImport(Compression)
-            if compressed.count > 0,
-                let srcBase = compressed.bindMemory(to: UInt8.self).baseAddress,
-                let dstBase = output.baseAddress?.assumingMemoryBound(to: UInt8.self)
-            {
-                let decodedCount = compression_decode_buffer(
-                    dstBase,
-                    maxOutputSize,
-                    srcBase,
-                    compressed.count,
-                    nil,
-                    COMPRESSION_LZ4_RAW
-                )
-                if decodedCount > 0 {
-                    return decodedCount
-                }
-                throw LZ4Error.decompressionFailed
-            }
-        #endif
-
-        let data = try decompressRawBlock(compressed, maxOutputSize: maxOutputSize)
-        guard data.count <= maxOutputSize else {
-            throw LZ4Error.decompressionFailed
-        }
-        data.withUnsafeBytes { src in
-            if let srcBase = src.baseAddress, let dstBase = output.baseAddress {
-                memcpy(dstBase, srcBase, data.count)
-            }
-        }
-        return data.count
-    }
-
-    public static func decompressBlockInto(
-        _ compressed: UnsafeRawBufferPointer,
-        uncompressedLength: Int,
-        output: UnsafeMutableRawBufferPointer
-    ) throws -> Int {
-        guard uncompressedLength > 0 else { return 0 }
-        guard output.count >= uncompressedLength else {
-            throw LZ4Error.decompressionFailed
-        }
-
-        if compressed.count >= 4,
-            let base = compressed.bindMemory(to: UInt8.self).baseAddress,
-            base[0] == 0x04,
-            base[1] == 0x22,
-            base[2] == 0x4D,
-            base[3] == 0x18
-        {
-            let data = Data(bytes: base, count: compressed.count)
-            let framed = try decompressStandardFrame(data, expectedSize: uncompressedLength)
-            guard framed.count == uncompressedLength else {
-                throw LZ4Error.decompressionFailed
-            }
-            framed.withUnsafeBytes { src in
-                if let srcBase = src.baseAddress, let dstBase = output.baseAddress {
-                    memcpy(dstBase, srcBase, framed.count)
-                }
-            }
-            return framed.count
-        }
-
-        return try decompressRawBlockInto(compressed, output: output)
-    }
-
-    // MARK: - Standard LZ4 Frame Decoding
-
     /// Decompresses a standard LZ4 frame.
-    ///
-    /// Handles the complete frame format including:
-    /// - Magic number validation
-    /// - Frame descriptor parsing
-    /// - Multiple compressed blocks
-    /// - Optional checksums
-    ///
-    /// - Parameters:
-    ///   - data: The framed compressed data.
-    ///   - expectedSize: Hint for output buffer allocation.
-    ///
-    /// - Returns: The decompressed data.
     private static func decompressStandardFrame(_ data: Data, expectedSize: Int) throws -> Data {
         var i = 0
 
