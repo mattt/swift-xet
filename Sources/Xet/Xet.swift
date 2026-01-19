@@ -4,47 +4,94 @@ import Foundation
 import NIOCore
 import NIOHTTP1
 
-/// Downloads files from Hugging Face's content-addressable storage (CAS)
-/// using the Xet protocol.
+/// Namespace for Xet download helpers.
 ///
-/// `XetDownloader` orchestrates the complete file download workflow:
-/// 1. Obtains CAS access credentials from the Hugging Face Hub
-/// 2. Fetches reconstruction metadata via the CAS API
-/// 3. Downloads and decompresses xorb chunks
-/// 4. Reassembles chunks into the original file
+/// Use ``withDownloader(refreshURL:hubToken:configuration:_:)``
+/// to create a downloader with a scoped lifetime,
 ///
 /// ## Usage
 ///
 /// Download a file to memory:
 ///
 /// ```swift
-/// let downloader = XetDownloader(
+/// let data = try await Xet.withDownloader(
 ///     refreshURL: tokenURL,
 ///     hubToken: "hf_..."
-/// )
-/// let data = try await downloader.data(for: fileID)
+/// ) { downloader in
+///     try await downloader.data(for: fileID)
+/// }
 /// ```
 ///
 /// Download a file to disk:
 ///
 /// ```swift
-/// try await downloader.download(fileID, to: destinationURL)
+/// try await Xet.withDownloader(
+///     refreshURL: tokenURL,
+///     hubToken: "hf_..."
+/// ) { downloader in
+///     try await downloader.download(for: fileID, to: destinationURL)
+/// }
 /// ```
 ///
 /// Both methods support partial downloads via the `byteRange` parameter.
 /// The downloader handles chunk-level alignment automatically,
 /// skipping bytes at the start and truncating at the end as needed.
-public struct XetDownloader: Sendable {
+public enum Xet {
+    /// Creates a downloader for the duration of the closure, then shuts it down.
+    public static func withDownloader<T>(
+        refreshURL: URL,
+        hubToken: String? = nil,
+        configuration: XetDownloader.Configuration = .default,
+        _ body: (XetDownloader) async throws -> T
+    ) async throws -> T {
+        let downloader = XetDownloader(
+            refreshURL: refreshURL,
+            hubToken: hubToken,
+            configuration: configuration
+        )
+        do {
+            let result = try await body(downloader)
+            try await downloader.shutdown()
+            return result
+        } catch {
+            try? await downloader.shutdown()
+            throw error
+        }
+    }
+}
+
+/// Downloader for Hugging Face CAS files using the Xet protocol.
+///
+/// Use ``Xet/withDownloader(refreshURL:hubToken:configuration:_:)``
+/// to create a downloader with a scoped lifetime.
+/// If you instantiate directly,
+/// call ``shutdown()`` when you are done to release HTTP client resources.
+public final class XetDownloader: @unchecked Sendable {
+    /// Hub token refresh endpoint for CAS credentials.
     private let refreshURL: URL
+
+    /// Optional Hub token used to authenticate refresh requests.
     private let hubToken: String?
+
+    /// Provides cached CAS access tokens with refresh coalescing.
     private let tokenProvider: TokenProvider
+
+    /// Client for CAS reconstruction metadata requests.
     private let casClient: CASClient
+
+    /// Pool of HTTP clients for xorb fetches.
     private let httpClientPool: HTTPClientPool
+
+    /// Cap on concurrent xorb fetch tasks.
     private let maxConcurrentFetches: Int
-    private let enableTaskMetricsLogging: Bool
+
+    /// Per-request timeout for xorb fetches.
     private let httpClientRequestTimeout: TimeAmount
-    private let maxConcurrentWrites: Int
+
+    /// Cap on concurrent decode operations.
     private let maxConcurrentDecodes: Int
+
+    /// Maximum in-flight buffers held during decoding.
     private let maxInflightBuffers: Int
 
     /// Whether to allow insecure (non-HTTPS) connections.
@@ -59,39 +106,46 @@ public struct XetDownloader: Sendable {
 
     /// Configuration for tuning downloader performance.
     public struct Configuration: Sendable {
+        /// Maximum number of xorb fetches running at once. Defaults to 64.
         public var maxConcurrentFetches: Int = 64
-        public var maxConcurrentDecodes: Int = Configuration.recommendedDecodeConcurrency
-        public var maxConcurrentWrites: Int = 64
-        public var maxInflightBuffers: Int = 8
+
+        /// Maximum number of chunk decode operations running at once.
+        /// Defaults to the active processor count.
+        public var maxConcurrentDecodes: Int = max(
+            1,
+            ProcessInfo.processInfo.activeProcessorCount
+        )
+
+        /// Maximum number of decoded buffers held in memory. Defaults to 16.
+        public var maxInflightBuffers: Int = 16
+
+        /// Maximum concurrent HTTP/1 connections per host. Defaults to 32.
         public var connectionsPerHost: Int = 32
-        public var prewarmedConnections: Int = 8
-        public var poolSize: Int = 2
-        public var forceHTTP1: Bool = true
-        public var connectTimeout: TimeInterval = 10
-        public var readTimeout: TimeInterval = 60
+
+        /// Number of prewarmed HTTP/1 connections per host. Defaults to 16.
+        public var prewarmedConnections: Int = 16
+
+        /// Number of HTTP clients in the pool. Defaults to 1.
+        public var poolSize: Int = 1
+
+        /// Connection timeout for HTTP requests, in seconds. Defaults to 60.
+        public var connectTimeout: TimeInterval = 60
+
+        /// Read timeout for HTTP requests, in seconds. Defaults to 120.
+        public var readTimeout: TimeInterval = 120
+
+        /// Whether to scale fetch concurrency based on connection pool size.
+        /// Defaults to true.
         public var autoScaleFetchConcurrency: Bool = true
-        public var enableTaskMetricsLogging: Bool = false
+
+        /// Whether to wait for network connectivity before failing.
+        /// Defaults to true.
         public var waitsForConnectivity: Bool = true
 
-        public static var recommendedDecodeConcurrency: Int {
-            max(1, ProcessInfo.processInfo.activeProcessorCount)
-        }
+        /// Idle timeout for pooled connections, in seconds. Defaults to 120.
+        public var idleTimeout: TimeInterval = 120
 
         public static let `default` = Configuration()
-
-        public static let highThroughput: Configuration = {
-            var config = Configuration()
-            config.maxConcurrentFetches = 64
-            config.maxConcurrentDecodes = Configuration.recommendedDecodeConcurrency
-            config.maxConcurrentWrites = 64
-            config.maxInflightBuffers = 16
-            config.connectionsPerHost = 32
-            config.prewarmedConnections = 16
-            config.poolSize = 1
-            config.connectTimeout = 60
-            config.readTimeout = 120
-            return config
-        }()
     }
 
     /// Creates a downloader configured for a specific repository.
@@ -105,23 +159,24 @@ public struct XetDownloader: Sendable {
     public init(
         refreshURL: URL,
         hubToken: String? = nil,
-        configuration: Configuration = .highThroughput
+        configuration: Configuration = .default
     ) {
         self.refreshURL = refreshURL
         self.hubToken = hubToken
         self.tokenProvider = TokenProvider(
-            urlSession: .shared,
-            enableDebugLogging: configuration.enableTaskMetricsLogging
+            urlSession: .shared
         )
         self.casClient = CASClient(urlSession: .shared)
         let effectiveMaxConcurrentFetches = max(1, configuration.maxConcurrentFetches)
-        let httpConfiguration = XetDownloader.makeHTTPClientConfiguration(
-            connectionsPerHost: configuration.connectionsPerHost,
-            prewarmedConnections: configuration.prewarmedConnections,
-            forceHTTP1: configuration.forceHTTP1,
-            connectTimeout: configuration.connectTimeout,
-            readTimeout: configuration.readTimeout,
-            waitsForConnectivity: configuration.waitsForConnectivity
+        let httpConfiguration = HTTPClient.Configuration(
+            xet: .init(
+                connectionsPerHost: configuration.connectionsPerHost,
+                prewarmedConnections: configuration.prewarmedConnections,
+                connectTimeout: configuration.connectTimeout,
+                readTimeout: configuration.readTimeout,
+                waitsForConnectivity: configuration.waitsForConnectivity,
+                idleTimeout: configuration.idleTimeout
+            )
         )
         self.httpClientPool = HTTPClientPool(
             configuration: httpConfiguration,
@@ -134,21 +189,17 @@ public struct XetDownloader: Sendable {
         } else {
             self.maxConcurrentFetches = effectiveMaxConcurrentFetches
         }
-        self.enableTaskMetricsLogging = configuration.enableTaskMetricsLogging
         self.httpClientRequestTimeout = .seconds(Int64(max(1, configuration.readTimeout)))
-        self.maxConcurrentWrites = max(1, configuration.maxConcurrentWrites)
         self.maxConcurrentDecodes = max(1, configuration.maxConcurrentDecodes)
         self.maxInflightBuffers = max(1, configuration.maxInflightBuffers)
     }
 
-    private func logDebug(_ message: @autoclosure () -> String) {
-        guard enableTaskMetricsLogging else {
-            return
+    deinit {
+        let pool = httpClientPool
+        Task {
+            try? await pool.shutdown()
         }
-        print(message())
     }
-
-    // MARK: - Public API
 
     /// Downloads a file and returns its contents as `Data`.
     ///
@@ -177,10 +228,11 @@ public struct XetDownloader: Sendable {
             return Data()
         }
         let writer = DataOutputWriter()
+        let target = WriteTarget.inMemory(writer)
         _ = try await download(
             fileID: fileID,
             byteRange: byteRange,
-            writer: writer
+            target: target
         )
         return await writer.data
     }
@@ -221,19 +273,34 @@ public struct XetDownloader: Sendable {
         if let byteRange, byteRange.isEmpty {
             return 0
         }
-        let writer = try PwriteFileWriter(destinationURL: destinationURL)
-        let written = try await download(
-            fileID: fileID,
-            byteRange: byteRange,
-            writer: writer
-        )
-        try await writer.close()
-        return written
+        let writer = try FileOutputWriter(destinationURL: destinationURL)
+        let target = WriteTarget.file(writer)
+        do {
+            let written = try await download(
+                fileID: fileID,
+                byteRange: byteRange,
+                target: target
+            )
+            try await target.closeIfNeeded()
+            return written
+        } catch {
+            await target.closeIfNeeded(catching: { _ in })
+            throw error
+        }
+    }
+
+    /// Shuts down the internal HTTP client pool.
+    ///
+    /// Call this when you are done with the downloader to release resources.
+    ///
+    /// - SeeAlso: ``Xet/withDownloader(refreshURL:hubToken:configuration:_:)`` for a more convenient way to create and use a downloader.
+    public func shutdown() async throws {
+        try await httpClientPool.shutdown()
     }
 
     // MARK: -
 
-    /// Core download implementation that writes to any ``OutputWriter``.
+    /// Core download implementation that writes to any ``WriteTarget``.
     ///
     /// Processes reconstruction terms in order, fetching xorb data and
     /// decompressing chunks. Implements caching for xorbs referenced by
@@ -241,11 +308,8 @@ public struct XetDownloader: Sendable {
     private func download(
         fileID: String,
         byteRange: Range<UInt64>?,
-        writer: some OutputWriter
+        target: WriteTarget
     ) async throws -> Int64 {
-        logDebug(
-            "XET DEBUG: download start fileID=\(fileID) byteRange=\(byteRange.map { "\($0.lowerBound)..<\($0.upperBound)" } ?? "nil")"
-        )
         // Validate file ID
         guard fileID.count == 64,
             fileID.allSatisfy({ $0.isHexDigit })
@@ -257,10 +321,6 @@ public struct XetDownloader: Sendable {
             for: refreshURL,
             hubToken: hubToken
         )
-        logDebug(
-            "XET DEBUG: connection acquired casURL=\(conn.casURL.absoluteString) accessTokenPrefix=\(conn.accessToken.prefix(12))"
-        )
-
         // Validate CAS URL uses HTTPS unless insecure connections are allowed
         if !allowsInsecureConnections && conn.casURL.scheme != "https" {
             throw XetDownloaderError.insecureURL(conn.casURL)
@@ -272,10 +332,6 @@ public struct XetDownloader: Sendable {
             accessToken: conn.accessToken,
             byteRange: byteRange
         )
-        logDebug(
-            "XET DEBUG: reconstruction terms=\(reconstruction.terms.count) fetchGroups=\(reconstruction.fetchInfo.count) offsetIntoFirstRange=\(reconstruction.offsetIntoFirstRange)"
-        )
-
         let maxBytesToWrite: UInt64? = byteRange.map { UInt64($0.count) }
         var remainingBytesToWrite = maxBytesToWrite
 
@@ -305,8 +361,6 @@ public struct XetDownloader: Sendable {
             guard let fetchURL = URL(string: fetchInfo.url) else {
                 throw XetDownloaderError.invalidFetchURL(fetchInfo.url)
             }
-            logDebug("XET DEBUG: fetchURL=\(fetchURL.absoluteString)")
-
             // Validate fetch URL uses HTTPS unless insecure connections are allowed
             if !allowsInsecureConnections && fetchURL.scheme != "https" {
                 throw XetDownloaderError.insecureURL(fetchURL)
@@ -315,8 +369,6 @@ public struct XetDownloader: Sendable {
             var request = URLRequest(url: fetchURL)
             request.httpMethod = "GET"
             request.setValue(fetchInfo.urlRangeHeaderValue, forHTTPHeaderField: "Range")
-            logDebug("XET DEBUG: request Range=\(fetchInfo.urlRangeHeaderValue)")
-
             let key = FetchRangeKey(
                 hash: term.hash,
                 start: fetchInfo.range.lowerBound,
@@ -340,9 +392,9 @@ public struct XetDownloader: Sendable {
 
         var totalWritten: Int64 = 0
         var writeOffset: Int64 = 0
-        let fetchSemaphore = AsyncSemaphore(value: maxConcurrentFetches)
+        let fetchSemaphore = AsyncSemaphore(maxConcurrentTasks: maxConcurrentFetches)
         var inflightFetches: [FetchRangeKey: Task<FetchedXorb, Error>] = [:]
-        let randomAccessWriter = writer as? RandomAccessOutputWriter
+        let writeRaw = target.writeContentsOf
 
         func termRange(from fetched: FetchedXorb, for term: CASClient.ReconstructionResponse.Term) throws -> Range<Int>
         {
@@ -390,18 +442,18 @@ public struct XetDownloader: Sendable {
             let offset = writeOffset
             writeOffset += Int64(upper - lower)
 
-            if let randomWriter = randomAccessWriter {
+            if let writeRaw {
                 try base.withUnsafeBytes { raw in
                     guard let baseAddress = raw.baseAddress else {
                         throw XetDownloaderError.invalidReconstruction
                     }
                     let start = baseAddress.advanced(by: lower)
                     let slice = UnsafeRawBufferPointer(start: start, count: upper - lower)
-                    try randomWriter.writeRaw(slice, at: offset)
+                    try writeRaw(slice, offset)
                 }
             } else {
                 let chunk = base.subdata(in: lower ..< upper)
-                try await writer.write(chunk)
+                try await target.write(chunk)
             }
 
             totalWritten += Int64(upper - lower)
@@ -421,8 +473,8 @@ public struct XetDownloader: Sendable {
             }
 
             inflightFetches[key] = Task {
-                await fetchSemaphore.acquire()
-                defer { Task { await fetchSemaphore.release() } }
+                await fetchSemaphore.wait()
+                defer { Task { await fetchSemaphore.signal() } }
                 return try await fetchXorbChunks(
                     termHash: term.hash,
                     fetchInfo: context.fetchInfo,
@@ -434,25 +486,16 @@ public struct XetDownloader: Sendable {
 
         for (termIndex, context) in termContexts.enumerated() {
             let term = context.term
-            let fetchInfo = context.fetchInfo
             let key = context.key
             if let remainingBytesToWrite, remainingBytesToWrite == 0 {
-                logDebug("XET DEBUG: remainingBytesToWrite=0, stopping")
                 break
             }
 
             if let cached = chunkCache[key] {
-                logDebug(
-                    "XET DEBUG: using cached chunks xorbHash=\(term.hash.prefix(12)) range=\(term.range.lowerBound)..<\(term.range.upperBound)"
-                )
                 let range = try termRange(from: cached, for: term)
                 try await writeTermData(base: cached.data, range: range)
                 continue
             }
-
-            logDebug(
-                "XET DEBUG: term xorbHash=\(term.hash.prefix(12)) termRange=\(term.range.lowerBound)..<\(term.range.upperBound) fetchRange=\(fetchInfo.range.lowerBound)..<\(fetchInfo.range.upperBound) urlRange=\(fetchInfo.urlRange.lowerBound)..<\(fetchInfo.urlRange.upperBound)"
-            )
 
             let shouldCacheAllForXorb = (xorbUsageCount[term.hash] ?? 0) > 1
             let prefetchLimit = min(termContexts.count, termIndex + maxConcurrentFetches)
@@ -472,10 +515,8 @@ public struct XetDownloader: Sendable {
             }
             let range = try termRange(from: fetchedChunks, for: term)
             try await writeTermData(base: fetchedChunks.data, range: range)
-            logDebug("XET DEBUG: finished term write for xorbHash=\(term.hash.prefix(12))")
         }
 
-        logDebug("XET DEBUG: download complete totalWritten=\(totalWritten)")
         return totalWritten
     }
 
@@ -485,9 +526,6 @@ public struct XetDownloader: Sendable {
         request: URLRequest,
         expectedUnpackedLength: Int?
     ) async throws -> FetchedXorb {
-        logDebug(
-            "XET DEBUG: fetch start xorbHash=\(termHash.prefix(12)) range=\(fetchInfo.range.lowerBound)..<\(fetchInfo.range.upperBound)"
-        )
         guard let url = request.url else {
             throw XetDownloaderError.fetchFailed(statusCode: nil, url: URL(fileURLWithPath: "/"))
         }
@@ -507,11 +545,8 @@ public struct XetDownloader: Sendable {
         guard (200 ..< 300).contains(statusCode) || statusCode == 206 else {
             throw XetDownloaderError.fetchFailed(statusCode: statusCode, url: url)
         }
-        logDebug(
-            "XET DEBUG: response status=\(statusCode) version=\(response.version) contentLength=\(response.headers.first(name: "Content-Length") ?? "nil")"
-        )
         let bufferSlots = max(2, min(maxInflightBuffers, maxConcurrentDecodes))
-        let bufferSemaphore = AsyncSemaphore(value: bufferSlots)
+        let bufferSemaphore = AsyncSemaphore(maxConcurrentTasks: bufferSlots)
         let stream = AsyncThrowingStream<ByteBuffer, Error> { continuation in
             let task = Task {
                 do {
@@ -519,7 +554,7 @@ public struct XetDownloader: Sendable {
                         if buffer.readableBytes == 0 {
                             continue
                         }
-                        await bufferSemaphore.acquire()
+                        await bufferSemaphore.wait()
                         continuation.yield(buffer)
                     }
                     continuation.finish()
@@ -535,9 +570,6 @@ public struct XetDownloader: Sendable {
             stream: stream,
             bufferSemaphore: bufferSemaphore,
             expectedUnpackedLength: expectedUnpackedLength
-        )
-        logDebug(
-            "XET DEBUG: finished fetch loop for xorbHash=\(termHash.prefix(12)) chunks=\(decoded.chunkByteIndices.count - 1)"
         )
         return FetchedXorb(
             data: decoded.data,
@@ -586,7 +618,7 @@ public struct XetDownloader: Sendable {
                     cursor.append(raw)
                 }
             }
-            await bufferSemaphore.release()
+            await bufferSemaphore.signal()
             try drainCursor(isEOF: false)
         }
 
@@ -616,7 +648,7 @@ public struct XetDownloader: Sendable {
                         cursor.append(raw)
                     }
                 }
-                await bufferSemaphore.release()
+                await bufferSemaphore.signal()
 
                 while cursor.count >= 8 {
                     guard let headerBytes = cursor.peek(count: 8) else { break }
@@ -649,7 +681,7 @@ public struct XetDownloader: Sendable {
                             }
 
                         case .lz4:
-                            _ = try LZ4.decompressBlockInto(
+                            _ = try LZ4.decompressBlock(
                                 compressed,
                                 uncompressedLength: header.uncompressedLength,
                                 output: outputSlice
@@ -661,12 +693,12 @@ public struct XetDownloader: Sendable {
                                 alignment: 16
                             )
                             defer { scratch.deallocate() }
-                            _ = try LZ4.decompressBlockInto(
+                            _ = try LZ4.decompressBlock(
                                 compressed,
                                 uncompressedLength: header.uncompressedLength,
                                 output: scratch
                             )
-                            BG4.regroupInto(from: UnsafeRawBufferPointer(scratch), to: outputSlice)
+                            BG4.regroup(UnsafeRawBufferPointer(scratch), into: outputSlice)
                         }
                     }
 
@@ -700,17 +732,22 @@ public struct XetDownloader: Sendable {
     }
 }
 
+/// Async semaphore for limiting concurrency.
 private actor AsyncSemaphore {
-    private var available: Int
+    /// Available permits for waiters.
+    private var availablePermits: Int
+    /// FIFO queue of suspended waiters.
     private var waiters: [CheckedContinuation<Void, Never>] = []
 
-    init(value: Int) {
-        self.available = max(0, value)
+    /// Creates a semaphore with the specified limit.
+    init(maxConcurrentTasks: Int) {
+        self.availablePermits = max(0, maxConcurrentTasks)
     }
 
-    func acquire() async {
-        if available > 0 {
-            available -= 1
+    /// Waits for a permit to become available.
+    func wait() async {
+        if availablePermits > 0 {
+            availablePermits -= 1
             return
         }
         await withCheckedContinuation { continuation in
@@ -718,20 +755,25 @@ private actor AsyncSemaphore {
         }
     }
 
-    func release() {
+    /// Releases a permit to the next waiter.
+    func signal() {
         if !waiters.isEmpty {
             let waiter = waiters.removeFirst()
             waiter.resume()
         } else {
-            available += 1
+            availablePermits += 1
         }
     }
 }
 
+/// Round-robin pool of HTTP clients.
 private actor HTTPClientPool {
+    /// Shared HTTP client instances.
     private let clients: [HTTPClient]
+    /// Next client index for round-robin selection.
     private var nextIndex = 0
 
+    /// Creates a pool with the specified size.
     init(configuration: HTTPClient.Configuration, size: Int) {
         let poolSize = max(1, size)
         var created: [HTTPClient] = []
@@ -747,12 +789,14 @@ private actor HTTPClientPool {
         self.clients = created
     }
 
+    /// Returns the next client in the pool.
     func nextClient() -> HTTPClient {
         let client = clients[nextIndex]
         nextIndex = (nextIndex + 1) % clients.count
         return client
     }
 
+    /// Shuts down all clients in the pool.
     func shutdown() async throws {
         for client in clients {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
@@ -768,7 +812,7 @@ private actor HTTPClientPool {
     }
 }
 
-// MARK: - XetDownloaderError
+// MARK: - Errors
 
 /// Errors that can occur during Xet file downloads.
 public enum XetDownloaderError: Error, Sendable {
@@ -847,17 +891,35 @@ extension XetDownloader {
     /// Concurrent requests for the same token are coalesced into a single
     /// network request.
     actor TokenProvider {
+        /// URL session used for token refresh requests.
         private let urlSession: URLSession
-        private let safetyWindow: TimeInterval
-        private let enableDebugLogging: Bool
 
-        private struct CacheKey: Hashable {
+        /// Window before expiration to treat tokens as stale.
+        private let safetyWindow: TimeInterval
+
+        /// Key for cached connection info.
+        private struct CacheKey: Hashable, Sendable {
             let refreshURL: URL
             let hubToken: String?
         }
 
+        /// CAS connection details obtained from the Hub token endpoint.
+        struct ConnectionInfo: Equatable, Sendable {
+            /// The CAS API base URL.
+            let casURL: URL
+
+            /// The bearer token for CAS API authentication.
+            let accessToken: String
+
+            /// When the access token expires.
+            let expiresAt: Date
+        }
+
+        /// Cached connection info by refresh URL and Hub token.
         private var cache: [CacheKey: ConnectionInfo] = [:]
-        private var inflight: [CacheKey: Task<ConnectionInfo, Swift.Error>] = [:]
+
+        /// Inflight token refresh tasks by cache key.
+        private var inflight: [CacheKey: Task<ConnectionInfo, Error>] = [:]
 
         /// Creates a token provider.
         ///
@@ -867,12 +929,10 @@ extension XetDownloader {
         ///     Defaults to 60 seconds.
         init(
             urlSession: URLSession = .shared,
-            safetyWindow: TimeInterval = 60,
-            enableDebugLogging: Bool = false
+            safetyWindow: TimeInterval = 60
         ) {
             self.urlSession = urlSession
             self.safetyWindow = safetyWindow
-            self.enableDebugLogging = enableDebugLogging
         }
 
         /// Obtains CAS connection info, using cached tokens when valid.
@@ -885,46 +945,27 @@ extension XetDownloader {
         func connectionInfo(for refreshURL: URL, hubToken: String?) async throws -> ConnectionInfo {
             let key = CacheKey(refreshURL: refreshURL, hubToken: hubToken)
 
-            if let cached = cache[key], cached.expiresAt > Date().addingTimeInterval(safetyWindow) {
-                if enableDebugLogging {
-                    print(
-                        "XET DEBUG: token cache hit refreshURL=\(refreshURL.absoluteString) expiresAt=\(cached.expiresAt)"
-                    )
-                }
+            if let cached = cache[key],
+                cached.expiresAt > Date().addingTimeInterval(safetyWindow)
+            {
                 return cached
             }
 
             if let existing = inflight[key] {
-                if enableDebugLogging {
-                    print("XET DEBUG: token request already inflight refreshURL=\(refreshURL.absoluteString)")
-                }
                 return try await existing.value
             }
 
-            let debugLogging = enableDebugLogging
             let task = Task { [urlSession] () throws -> ConnectionInfo in
-                if debugLogging {
-                    print("XET DEBUG: token request start refreshURL=\(refreshURL.absoluteString)")
-                }
                 var request = URLRequest(url: refreshURL)
                 request.httpMethod = "GET"
                 request.cachePolicy = .reloadIgnoringLocalCacheData
                 if let hubToken {
                     request.setValue("Bearer \(hubToken)", forHTTPHeaderField: "Authorization")
-                    if debugLogging {
-                        print("XET DEBUG: token request has auth header tokenPrefix=\(hubToken.prefix(8))")
-                    }
                 }
 
                 let (data, response) = try await urlSession.data(for: request)
                 guard let http = response as? HTTPURLResponse else {
-                    if debugLogging {
-                        print("XET DEBUG: token response not HTTPURLResponse")
-                    }
                     throw XetDownloaderError.invalidTokenResponse
-                }
-                if debugLogging {
-                    print("XET DEBUG: token response status=\(http.statusCode) bytes=\(data.count)")
                 }
                 guard (200 ..< 300).contains(http.statusCode) else {
                     throw XetDownloaderError.tokenRequestFailed(
@@ -937,9 +978,6 @@ extension XetDownloader {
                 do {
                     decoded = try JSONDecoder().decode(TokenResponse.self, from: data)
                 } catch {
-                    if debugLogging {
-                        print("XET DEBUG: token decode failed error=\(error.localizedDescription)")
-                    }
                     throw XetDownloaderError.invalidTokenResponse
                 }
                 guard let casURL = URL(string: decoded.casUrl) else {
@@ -947,11 +985,6 @@ extension XetDownloader {
                 }
 
                 let expiresAt = Date(timeIntervalSince1970: TimeInterval(decoded.exp))
-                if debugLogging {
-                    print(
-                        "XET DEBUG: token decoded casURL=\(casURL.absoluteString) expiresAt=\(expiresAt) accessTokenPrefix=\(decoded.accessToken.prefix(12))"
-                    )
-                }
                 return ConnectionInfo(
                     casURL: casURL,
                     accessToken: decoded.accessToken,
@@ -972,18 +1005,6 @@ extension XetDownloader {
         }
     }
 
-    /// CAS connection details obtained from the Hub token endpoint.
-    struct ConnectionInfo: Equatable, Sendable {
-        /// The CAS API base URL.
-        let casURL: URL
-
-        /// The bearer token for CAS API authentication.
-        let accessToken: String
-
-        /// When the access token expires.
-        let expiresAt: Date
-    }
-
     /// JSON response from the Hub token endpoint.
     private struct TokenResponse: Equatable, Codable, Sendable {
         let accessToken: String
@@ -994,70 +1015,34 @@ extension XetDownloader {
 
 // MARK: - Private Helpers
 
-extension XetDownloader {
-    private static func makeHTTPClientConfiguration(
-        connectionsPerHost: Int,
-        prewarmedConnections: Int,
-        forceHTTP1: Bool,
-        connectTimeout: TimeInterval,
-        readTimeout: TimeInterval,
-        waitsForConnectivity: Bool
-    ) -> HTTPClient.Configuration {
-        var configuration = HTTPClient.Configuration()
-        configuration.httpVersion = forceHTTP1 ? .http1Only : .automatic
-        configuration.timeout = .init(
-            connect: .seconds(Int64(connectTimeout)),
-            read: .seconds(Int64(readTimeout))
+fileprivate struct XetHTTPClientConfiguration {
+    let connectionsPerHost: Int
+    let prewarmedConnections: Int
+    let connectTimeout: TimeInterval
+    let readTimeout: TimeInterval
+    let waitsForConnectivity: Bool
+    let idleTimeout: TimeInterval
+}
+
+extension HTTPClient.Configuration {
+    fileprivate init(xet configuration: XetHTTPClientConfiguration) {
+        self = HTTPClient.Configuration()
+        httpVersion = .http1Only
+        timeout = .init(
+            connect: .seconds(Int64(configuration.connectTimeout)),
+            read: .seconds(Int64(configuration.readTimeout))
         )
-        configuration.connectionPool.concurrentHTTP1ConnectionsPerHostSoftLimit = max(
+        connectionPool.concurrentHTTP1ConnectionsPerHostSoftLimit = max(
             1,
-            connectionsPerHost
+            configuration.connectionsPerHost
         )
-        configuration.connectionPool.idleTimeout = .seconds(120)
-        configuration.connectionPool.preWarmedHTTP1ConnectionCount = max(
+        connectionPool.idleTimeout = .seconds(Int64(max(1, configuration.idleTimeout)))
+        connectionPool.preWarmedHTTP1ConnectionCount = max(
             0,
-            min(prewarmedConnections, connectionsPerHost)
+            min(configuration.prewarmedConnections, configuration.connectionsPerHost)
         )
-        configuration.networkFrameworkWaitForConnectivity = waitsForConnectivity
-        configuration.enableMultipath = true
-        return configuration
-    }
-}
-
-// MARK: - HTTPClient Lifecycle
-
-extension XetDownloader {
-    /// Shuts down the internal HTTP client pool.
-    ///
-    /// Call this when you are done with the downloader to release resources.
-    public func shutdown() async throws {
-        try await httpClientPool.shutdown()
-    }
-}
-
-// MARK: - Lifecycle Helpers
-
-extension XetDownloader {
-    /// Creates a downloader for the duration of the closure, then shuts it down.
-    public static func withDownloader<T>(
-        refreshURL: URL,
-        hubToken: String? = nil,
-        configuration: Configuration = .highThroughput,
-        _ body: (XetDownloader) async throws -> T
-    ) async throws -> T {
-        let downloader = XetDownloader(
-            refreshURL: refreshURL,
-            hubToken: hubToken,
-            configuration: configuration
-        )
-        do {
-            let result = try await body(downloader)
-            try await downloader.shutdown()
-            return result
-        } catch {
-            try? await downloader.shutdown()
-            throw error
-        }
+        networkFrameworkWaitForConnectivity = configuration.waitsForConnectivity
+        enableMultipath = true
     }
 }
 
@@ -1070,6 +1055,7 @@ private struct FetchRangeKey: Hashable {
     let urlRangeEnd: UInt64
 }
 
+/// A fetched xorb chunk.
 private struct FetchedXorb {
     let data: Data
     let chunkByteIndices: [Int]
@@ -1077,18 +1063,59 @@ private struct FetchedXorb {
 }
 
 /// A destination for writing downloaded chunk data.
-protocol OutputWriter: Sendable {
-    func write(_ data: Data) async throws
-}
+private struct WriteTarget: Sendable {
+    /// Writes sequential chunk data in order.
+    let write: @Sendable (Data) async throws -> Void
 
-protocol RandomAccessOutputWriter: OutputWriter {
-    func write(_ data: Data, at offset: Int64) async throws
-    func writeRaw(_ buffer: UnsafeRawBufferPointer, at offset: Int64) throws
-    func close() async throws
+    /// Writes raw bytes to a specific output offset.
+    let writeContentsOf: (@Sendable (UnsafeRawBufferPointer, Int64) throws -> Void)?
+
+    /// Closes the destination when available.
+    let close: (@Sendable () async throws -> Void)?
+
+    static func inMemory(_ writer: DataOutputWriter) -> WriteTarget {
+        WriteTarget(
+            write: { chunk in
+                try await writer.write(chunk)
+            },
+            writeContentsOf: nil,
+            close: nil
+        )
+    }
+
+    static func file(_ writer: FileOutputWriter) -> WriteTarget {
+        WriteTarget(
+            write: { chunk in
+                try await writer.write(chunk)
+            },
+            writeContentsOf: { buffer, offset in
+                try writer.write(contentsOf: buffer, at: offset)
+            },
+            close: {
+                try await writer.close()
+            }
+        )
+    }
+
+    func closeIfNeeded() async throws {
+        if let close {
+            try await close()
+        }
+    }
+
+    func closeIfNeeded(catching handler: (Error) -> Void) async {
+        if let close {
+            do {
+                try await close()
+            } catch {
+                handler(error)
+            }
+        }
+    }
 }
 
 /// An in-memory output writer that accumulates data.
-actor DataOutputWriter: OutputWriter {
+actor DataOutputWriter {
     private(set) var data = Data()
 
     func write(_ data: Data) async throws {
@@ -1096,26 +1123,10 @@ actor DataOutputWriter: OutputWriter {
     }
 }
 
-/// An output writer that writes to a file.
-actor FileOutputWriter: OutputWriter {
-    private let handle: FileHandle
-
-    init(destinationURL: URL) throws {
-        self.handle = try FileHandle(forWritingTo: destinationURL)
-    }
-
-    func write(_ data: Data) async throws {
-        try handle.write(contentsOf: data)
-    }
-
-    func close() throws {
-        try handle.close()
-    }
-}
-
 /// A random access output writer backed by POSIX pwrite.
-final class PwriteFileWriter: RandomAccessOutputWriter {
+final class FileOutputWriter: @unchecked Sendable {
     private let fd: Int32
+    private var sequentialOffset: Int64 = 0
 
     init(destinationURL: URL) throws {
         let fm = FileManager.default
@@ -1132,17 +1143,7 @@ final class PwriteFileWriter: RandomAccessOutputWriter {
         self.fd = fd
     }
 
-    func write(_ data: Data) async throws {
-        try await write(data, at: 0)
-    }
-
-    func write(_ data: Data, at offset: Int64) async throws {
-        try data.withUnsafeBytes { rawBuffer in
-            try writeRaw(rawBuffer, at: offset)
-        }
-    }
-
-    func writeRaw(_ buffer: UnsafeRawBufferPointer, at offset: Int64) throws {
+    func write(contentsOf buffer: UnsafeRawBufferPointer, at offset: Int64) throws {
         if buffer.count == 0 {
             return
         }
@@ -1165,6 +1166,14 @@ final class PwriteFileWriter: RandomAccessOutputWriter {
             bytesRemaining -= written
             localOffset += written
         }
+    }
+
+    func write(_ data: Data) async throws {
+        let offset = sequentialOffset
+        try data.withUnsafeBytes { rawBuffer in
+            try write(contentsOf: rawBuffer, at: offset)
+        }
+        sequentialOffset += Int64(data.count)
     }
 
     func close() async throws {

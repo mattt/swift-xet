@@ -67,10 +67,10 @@ struct IntegrationTests {
         #expect(fileID != nil)
         guard let fileID else { return }
 
-        let downloader = XetDownloader(refreshURL: refreshURL)
-
         let range: Range<UInt64> = 0 ..< (512 * 1024)
-        let bytes1 = try await downloader.data(for: fileID, byteRange: range)
+        let bytes1 = try await Xet.withDownloader(refreshURL: refreshURL) { downloader in
+            try await downloader.data(for: fileID, byteRange: range)
+        }
 
         #expect(!bytes1.isEmpty)
         #expect(bytes1.count <= Int(range.count))
@@ -80,7 +80,9 @@ struct IntegrationTests {
             ) == true
         )
 
-        let bytes2 = try await downloader.data(for: fileID, byteRange: range)
+        let bytes2 = try await Xet.withDownloader(refreshURL: refreshURL) { downloader in
+            try await downloader.data(for: fileID, byteRange: range)
+        }
         #expect(bytes1 == bytes2)
     }
 
@@ -103,18 +105,18 @@ struct IntegrationTests {
         #expect(fileID != nil)
         guard let fileID else { return }
 
-        let downloader = XetDownloader(refreshURL: refreshURL)
-
         let tempDir = FileManager.default.temporaryDirectory
         let destinationURL = tempDir.appendingPathComponent(UUID().uuidString + ".csv")
         defer { try? FileManager.default.removeItem(at: destinationURL) }
 
         let range: Range<UInt64> = 0 ..< (256 * 1024)
-        let bytesWritten = try await downloader.download(
-            fileID,
-            byteRange: range,
-            to: destinationURL
-        )
+        let bytesWritten = try await Xet.withDownloader(refreshURL: refreshURL) { downloader in
+            try await downloader.download(
+                fileID,
+                byteRange: range,
+                to: destinationURL
+            )
+        }
 
         #expect(bytesWritten > 0)
         #expect(bytesWritten <= Int64(range.count))

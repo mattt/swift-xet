@@ -10,8 +10,6 @@ import Foundation
 /// It groups bytes by their position within 4-byte units,
 /// creating runs of similar byte values that compress better.
 ///
-/// ## How It Works
-///
 /// Given input bytes `[A1, A2, A3, A4, B1, B2, B3, B4, ...]`:
 /// - Group 0 contains all first bytes: `[A1, B1, C1, ...]`
 /// - Group 1 contains all second bytes: `[A2, B2, C2, ...]`
@@ -24,11 +22,9 @@ import Foundation
 /// data where bytes at the same position often have similar values
 /// (e.g., exponent bytes cluster together).
 ///
-/// ## Usage
-///
 /// The xorb format uses BG4 with the `byteGrouping4LZ4` compression scheme.
-/// Decoding applies LZ4 decompression first, then ``regroup(_:)`` to restore
-/// the original byte order.
+/// Decoding applies LZ4 decompression first,
+/// then ``regroup(_:)`` to restore the original byte order.
 public enum BG4 {
     /// Restores interleaved byte order from BG4-grouped data.
     ///
@@ -48,7 +44,7 @@ public enum BG4 {
         var out = Data(count: n)
         out.withUnsafeMutableBytes { outRaw in
             grouped.withUnsafeBytes { inRaw in
-                regroupInto(from: inRaw, to: outRaw)
+                regroup(inRaw, into: outRaw)
             }
         }
         return out
@@ -59,9 +55,9 @@ public enum BG4 {
     /// - Parameters:
     ///   - grouped: Source buffer with bytes grouped by position mod 4.
     ///   - output: Destination buffer (must be at least as large as source).
-    public static func regroupInto(
-        from grouped: UnsafeRawBufferPointer,
-        to output: UnsafeMutableRawBufferPointer
+    public static func regroup(
+        _ grouped: UnsafeRawBufferPointer,
+        into output: UnsafeMutableRawBufferPointer
     ) {
         let n = grouped.count
         guard n > 0, output.count >= n else { return }

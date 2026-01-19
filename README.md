@@ -56,16 +56,16 @@ To download a file, you need:
 ```swift
 import Xet
 
-let downloader = XetDownloader(
+try await Xet.withDownloader(
     refreshURL: refreshURL,
     hubToken: "hf_..."  // optional, required for private repos
-)
+) { downloader in
+    // Download to memory
+    let data = try await downloader.data(for: fileID)
 
-// Download to memory
-let data = try await downloader.data(for: fileID)
-
-// Download to disk
-try await downloader.download(fileID, to: destinationURL)
+    // Download to disk
+    try await downloader.download(fileID, to: destinationURL)
+}
 ```
 
 ### Partial Downloads

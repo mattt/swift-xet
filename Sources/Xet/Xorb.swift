@@ -30,20 +30,48 @@ public enum Xorb {
     /// - Returns: An async sequence yielding uncompressed `Data` for each chunk.
     public static func decode<S: AsyncSequence>(bytes: S) -> ChunkSequence<S>
     where S.Element == UInt8 {
-        ChunkSequence(source: bytes)
+        ChunkSequence(
+            source: bytes,
+            appendElement: { byte, cursor in
+                cursor.append(byte)
+            }
+        )
     }
 
-    /// Decodes an async data sequence into uncompressed chunks.
+    /// Decodes a contiguous xorb buffer into uncompressed chunks.
     ///
-    /// - Parameter buffers: An async sequence of `Data` buffers representing xorb data.
-    /// - Returns: An async sequence yielding uncompressed `Data` for each chunk.
-    public static func decode<S: AsyncSequence>(buffers: S) -> DataChunkSequence<S>
-    where S.Element == Data {
-        DataChunkSequence(source: buffers)
+    /// - Parameter data: The complete xorb payload.
+    /// - Returns: All decoded chunk payloads in order.
+    /// - Throws: ``XorbError`` if the stream is malformed.
+    public static func decode(_ data: Data) throws -> [Data] {
+        try data.withUnsafeBytes { raw in
+            try decode(raw)
+        }
+    }
+
+    /// Decodes a contiguous xorb buffer into uncompressed chunks.
+    ///
+    /// - Parameter bytes: The complete xorb payload.
+    /// - Returns: All decoded chunk payloads in order.
+    /// - Throws: ``XorbError`` if the stream is malformed.
+    public static func decode(_ bytes: UnsafeRawBufferPointer) throws -> [Data] {
+        var cursor = ByteCursor()
+        cursor.append(bytes)
+        var chunks: [Data] = []
+        while true {
+            if let chunk = try decodeNextChunk(from: &cursor) {
+                chunks.append(chunk)
+                continue
+            }
+            if cursor.count == 0 {
+                return chunks
+            }
+            throw XorbError.truncatedStream
+        }
     }
 
     /// Compression schemes supported by the xorb format.
-    enum CompressionScheme: UInt8, Sendable {
+    public enum CompressionScheme: UInt8, Sendable {
         /// No compression; data stored as-is.
         case none = 0
 
@@ -58,11 +86,15 @@ public enum Xorb {
     }
 
     /// Parsed chunk header containing size and compression metadata.
-    struct Header: Sendable, Equatable {
-        let version: UInt8
-        let compressedLength: Int
-        let compressionScheme: CompressionScheme
-        let uncompressedLength: Int
+    public struct Header: Sendable, Equatable {
+        /// Protocol version byte.
+        public let version: UInt8
+        /// Compressed payload size in bytes.
+        public let compressedLength: Int
+        /// Compression scheme for the payload.
+        public let compressionScheme: CompressionScheme
+        /// Uncompressed payload size in bytes.
+        public let uncompressedLength: Int
     }
 
     /// Parses an 8-byte chunk header.
@@ -70,13 +102,18 @@ public enum Xorb {
     /// - Parameter bytes: Exactly 8 bytes of header data.
     /// - Returns: The parsed header.
     /// - Throws: ``XorbError`` if the header is invalid.
-    static func parseHeader(_ bytes: Data) throws -> Header {
-        guard bytes.count == 8 else { throw XorbError.invalidLength }
-        return try bytes.withUnsafeBytes { raw in
+    public static func parseHeader(_ data: Data) throws -> Header {
+        guard data.count == 8 else { throw XorbError.invalidLength }
+        return try data.withUnsafeBytes { raw in
             try parseHeader(raw)
         }
     }
 
+    /// Parses an 8-byte chunk header from a raw buffer.
+    ///
+    /// - Parameter bytes: Buffer containing at least 8 bytes of header data.
+    /// - Returns: The parsed header.
+    /// - Throws: ``XorbError`` if the header is invalid.
     static func parseHeader(_ bytes: UnsafeRawBufferPointer) throws -> Header {
         guard bytes.count >= 8 else { throw XorbError.invalidLength }
 
@@ -108,7 +145,7 @@ public enum Xorb {
     ///   - header: The parsed chunk header.
     /// - Returns: The uncompressed chunk data.
     /// - Throws: ``XorbError`` if decompression fails.
-    static func decodePayload(compressed: Data, header: Header) throws -> Data {
+    static func decodePayload(_ compressed: Data, header: Header) throws -> Data {
         switch header.compressionScheme {
         case .none:
             guard compressed.count == header.uncompressedLength else {
@@ -143,7 +180,14 @@ public enum Xorb {
         }
     }
 
-    static func decodePayload(compressed: UnsafeRawBufferPointer, header: Header) throws -> Data {
+    /// Decompresses a raw payload buffer according to the header.
+    ///
+    /// - Parameters:
+    ///   - compressed: The compressed payload bytes.
+    ///   - header: The parsed chunk header.
+    /// - Returns: The uncompressed chunk data.
+    /// - Throws: ``XorbError`` if decompression fails.
+    static func decodePayload(_ compressed: UnsafeRawBufferPointer, header: Header) throws -> Data {
         switch header.compressionScheme {
         case .none:
             guard compressed.count == header.uncompressedLength else {
@@ -181,6 +225,11 @@ public enum Xorb {
         }
     }
 
+    /// Decodes the next chunk in a cursor, if available.
+    ///
+    /// - Parameter cursor: The byte cursor to read from.
+    /// - Returns: The next uncompressed chunk, or `nil` if more data is needed.
+    /// - Throws: ``XorbError`` if the chunk is malformed.
     static func decodeNextChunk(from cursor: inout ByteCursor) throws -> Data? {
         var consumeCount = 0
         let chunk = try cursor.withUnsafeReadableBytes { raw -> Data? in
@@ -192,7 +241,7 @@ public enum Xorb {
             let payloadStart = base.advanced(by: 8)
             let payload = UnsafeRawBufferPointer(start: payloadStart, count: header.compressedLength)
             consumeCount = totalLength
-            return try decodePayload(compressed: payload, header: header)
+            return try decodePayload(payload, header: header)
         }
         if chunk != nil {
             cursor.consume(count: consumeCount)
@@ -206,15 +255,16 @@ public enum Xorb {
 extension Xorb {
     /// An async sequence that yields uncompressed chunks from xorb data.
     ///
-    /// Wraps a source byte stream and parses/decompresses chunks on demand.
+    /// Wraps a source byte or data stream and parses/decompresses chunks on demand.
     /// Each iteration yields the decompressed `Data` for one chunk.
-    public struct ChunkSequence<S: AsyncSequence>: AsyncSequence where S.Element == UInt8 {
+    public struct ChunkSequence<S: AsyncSequence>: AsyncSequence {
         public typealias Element = Data
 
         fileprivate let source: S
+        fileprivate let appendElement: (S.Element, inout ByteCursor) -> Void
 
         public func makeAsyncIterator() -> AsyncIterator {
-            AsyncIterator(source: source)
+            AsyncIterator(source: source, appendElement: appendElement)
         }
 
         /// The async iterator for xorb chunk decoding.
@@ -222,9 +272,14 @@ extension Xorb {
             private var iterator: S.AsyncIterator
             private var cursor = ByteCursor()
             private var reachedEOF = false
+            private let appendElement: (S.Element, inout ByteCursor) -> Void
 
-            fileprivate init(source: S) {
+            fileprivate init(
+                source: S,
+                appendElement: @escaping (S.Element, inout ByteCursor) -> Void
+            ) {
                 self.iterator = source.makeAsyncIterator()
+                self.appendElement = appendElement
             }
 
             /// Returns the next uncompressed chunk, or `nil` at end of stream.
@@ -240,56 +295,8 @@ extension Xorb {
                         throw XorbError.truncatedStream
                     }
 
-                    if let b = try await iterator.next() {
-                        cursor.append(b)
-                    } else {
-                        reachedEOF = true
-                    }
-                }
-            }
-        }
-    }
-}
-
-// MARK: - Xorb.DataChunkSequence
-
-extension Xorb {
-    /// An async sequence that yields uncompressed chunks from xorb data.
-    ///
-    /// Wraps a source `Data` stream and parses/decompresses chunks on demand.
-    /// Each iteration yields the decompressed `Data` for one chunk.
-    public struct DataChunkSequence<S: AsyncSequence>: AsyncSequence where S.Element == Data {
-        public typealias Element = Data
-
-        fileprivate let source: S
-
-        public func makeAsyncIterator() -> AsyncIterator {
-            AsyncIterator(source: source)
-        }
-
-        public struct AsyncIterator: AsyncIteratorProtocol {
-            private var iterator: S.AsyncIterator
-            private var cursor = ByteCursor()
-            private var reachedEOF = false
-
-            fileprivate init(source: S) {
-                self.iterator = source.makeAsyncIterator()
-            }
-
-            public mutating func next() async throws -> Data? {
-                while true {
-                    if let chunk = try Xorb.decodeNextChunk(from: &cursor) {
-                        return chunk
-                    }
-                    if reachedEOF {
-                        if cursor.count == 0 {
-                            return nil
-                        }
-                        throw XorbError.truncatedStream
-                    }
-
-                    if let data = try await iterator.next() {
-                        cursor.append(data)
+                    if let next = try await iterator.next() {
+                        appendElement(next, &cursor)
                     } else {
                         reachedEOF = true
                     }
