@@ -4,7 +4,12 @@ import AsyncHTTPClient
 #elseif canImport(Glibc)
     import Glibc
 #endif
+
 import Foundation
+#if canImport(FoundationNetworking)
+    import FoundationNetworking
+#endif
+
 import NIOConcurrencyHelpers
 import NIOCore
 import NIOHTTP1

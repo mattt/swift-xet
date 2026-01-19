@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(FoundationNetworking)
+    import FoundationNetworking
+#endif
 
 /// Client for the Xet Content Addressable Storage (CAS) reconstruction API.
 ///
