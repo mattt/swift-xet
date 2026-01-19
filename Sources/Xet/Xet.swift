@@ -1,5 +1,9 @@
 import AsyncHTTPClient
-import Darwin
+#if canImport(Darwin)
+    import Darwin
+#elseif canImport(Glibc)
+    import Glibc
+#endif
 import Foundation
 import NIOConcurrencyHelpers
 import NIOCore
