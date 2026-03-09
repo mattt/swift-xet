@@ -165,3 +165,6 @@ You can run the tests with `swift test`.
 
 [good-first-issues]: https://github.com/huggingface/swift-xet/issues?q=is%3Aissue%20state%3Aopen%20label%3A%22good%20first%20issue%22
 
+## License
+
+[Apache 2](LICENSE).
