@@ -29,7 +29,7 @@ Add the following to your `Package.swift` file:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/mattt/swift-xet.git", from: "0.2.0")
+    .package(url: "https://github.com/huggingface/swift-xet.git", from: "0.2.0")
 ]
 ```
 
