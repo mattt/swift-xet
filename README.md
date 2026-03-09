@@ -151,3 +151,17 @@ Each chunk has an 8-byte header specifying:
 
 BG4 (Byte Grouping 4) is a preprocessing step that improves compression
 for floating-point and structured data by grouping bytes by position.
+
+## Contributing
+
+This is a community project and we welcome contributions.
+Please check out
+[Issues tagged with `good first issue`][good-first-issues]
+if you are looking for a place to start!
+
+Please ensure your code passes the build and test suite
+before submitting a pull request.
+You can run the tests with `swift test`.
+
+[good-first-issues]: https://github.com/huggingface/swift-xet/issues?q=is%3Aissue%20state%3Aopen%20label%3A%22good%20first%20issue%22
+
