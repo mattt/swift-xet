@@ -152,6 +152,15 @@ Each chunk has an 8-byte header specifying:
 BG4 (Byte Grouping 4) is a preprocessing step that improves compression
 for floating-point and structured data by grouping bytes by position.
 
+## Alternatives Considered
+
+We initially tried bridging
+[xet-core](https://github.com/huggingface/xet-core) Rust code
+into Swift through FFI using [UniFFI](https://mozilla.github.io/uniffi-rs/).
+This approach was heavy and cumbersome,
+and the indirection made it difficult to tune the HTTP stack.
+We had better luck porting the code into Swift directly.
+
 ## Contributing
 
 This is a community project and we welcome contributions.
