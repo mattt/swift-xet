@@ -257,7 +257,8 @@ public final class XetDownloader: @unchecked Sendable {
     ///   to write directly to disk instead.
     public func data(
         for fileID: String,
-        byteRange: Range<UInt64>? = nil
+        byteRange: Range<UInt64>? = nil,
+        progressHandler: (@Sendable (_ bytesWritten: Int64, _ totalBytes: Int64) -> Void)? = nil
     ) async throws -> Data {
         if let byteRange, byteRange.isEmpty {
             return Data()
@@ -267,7 +268,8 @@ public final class XetDownloader: @unchecked Sendable {
         _ = try await download(
             fileID: fileID,
             byteRange: byteRange,
-            target: target
+            target: target,
+            progressHandler: progressHandler
         )
         return await writer.data
     }
@@ -298,7 +300,8 @@ public final class XetDownloader: @unchecked Sendable {
         _ fileID: String,
         byteRange: Range<UInt64>? = nil,
         to destinationURL: URL,
-        fileManager: FileManager = .default
+        fileManager: FileManager = .default,
+        progressHandler: (@Sendable (_ bytesWritten: Int64, _ totalBytes: Int64) -> Void)? = nil
     ) async throws -> Int64 {
         if fileManager.fileExists(atPath: destinationURL.path) {
             try fileManager.removeItem(at: destinationURL)
@@ -316,7 +319,8 @@ public final class XetDownloader: @unchecked Sendable {
             let written = try await download(
                 fileID: fileID,
                 byteRange: byteRange,
-                target: target
+                target: target,
+                progressHandler: progressHandler
             )
             try await target.closeIfNeeded()
             return written
@@ -349,7 +353,8 @@ public final class XetDownloader: @unchecked Sendable {
     private func download(
         fileID: String,
         byteRange: Range<UInt64>?,
-        target: WriteTarget
+        target: WriteTarget,
+        progressHandler: (@Sendable (_ bytesWritten: Int64, _ totalBytes: Int64) -> Void)? = nil
     ) async throws -> Int64 {
         // Validate file ID
         guard fileID.count == 64,
@@ -446,6 +451,35 @@ public final class XetDownloader: @unchecked Sendable {
         var inflightFetches: [FetchRangeKey: Task<FetchedXorb, Error>] = [:]
         let writeRaw = target.writeContentsOf
 
+        let totalBytes = reconstruction.expectedTotalBytes(byteRange: byteRange)
+
+        let progressWorkQueue = DispatchQueue(label: "Xet.download.progress")
+        var bytesDecodedSoFar: Int64 = 0
+        var lastUpdatedBytes: Int64 = 0
+        
+        // Update very 1 MB
+        let progressReportingByteInterval: Int64 = 1 * 2024 * 1024
+
+        let onChunkDecoded: (@Sendable (Int) -> Void)?
+
+        if let progressHandler {
+            // Set the total number of bytes we need to decode
+            progressHandler(0, totalBytes)
+            
+            onChunkDecoded = { count in
+                // Enter all progress handler updates into the progress work queue. Ensures serialized updates of the progress without waiting hanging for a mutex.
+                progressWorkQueue.async {
+                    bytesDecodedSoFar = max(Int64(count) + bytesDecodedSoFar, bytesDecodedSoFar)
+                    
+                    guard bytesDecodedSoFar >= lastUpdatedBytes + progressReportingByteInterval else { return }
+                    lastUpdatedBytes = bytesDecodedSoFar
+                    progressHandler(min(bytesDecodedSoFar, totalBytes), totalBytes)
+                }
+            }
+        } else {
+            onChunkDecoded = nil
+        }
+
         func termRange(from fetched: FetchedXorb, for term: CASClient.ReconstructionResponse.Term) throws -> Range<Int>
         {
             let startIndex = term.range.lowerBound - fetched.chunkRange.lowerBound
@@ -507,8 +541,17 @@ public final class XetDownloader: @unchecked Sendable {
             }
 
             totalWritten += Int64(upper - lower)
+            
+            // Once a term finishes, its total written bytes is most likely different from the amount we accumulated during the `onChunkDecoded` callbacks. This is because the chunks ofen use cached bits from previous term decodings.
+            if let progressHandler {
+                progressWorkQueue.async {
+                    bytesDecodedSoFar = max(bytesDecodedSoFar, totalWritten)
+                    lastUpdatedBytes = bytesDecodedSoFar
+                    progressHandler(min(bytesDecodedSoFar, totalBytes), totalBytes)
+                }
+            }
         }
-
+        
         func ensureFetchTask(for context: TermContext) {
             let term = context.term
             let key = context.key
@@ -529,7 +572,8 @@ public final class XetDownloader: @unchecked Sendable {
                         termHash: term.hash,
                         fetchInfo: context.fetchInfo,
                         request: context.request,
-                        expectedUnpackedLength: expectedUnpackedLength
+                        expectedUnpackedLength: expectedUnpackedLength,
+                        onChunkDecoded: onChunkDecoded
                     )
                     await fetchSemaphore.signal()
                     return fetched
@@ -580,7 +624,8 @@ public final class XetDownloader: @unchecked Sendable {
         termHash: String,
         fetchInfo: CASClient.ReconstructionResponse.FetchInfo,
         request: URLRequest,
-        expectedUnpackedLength: Int?
+        expectedUnpackedLength: Int?,
+        onChunkDecoded: (@Sendable (Int) -> Void)? = nil
     ) async throws -> FetchedXorb {
         guard let url = request.url else {
             throw XetDownloaderError.fetchFailed(statusCode: nil, url: URL(fileURLWithPath: "/"))
@@ -631,7 +676,8 @@ public final class XetDownloader: @unchecked Sendable {
         let decoded = try await decodeXorbStream(
             stream: stream,
             bufferSemaphore: bufferSemaphore,
-            expectedUnpackedLength: expectedUnpackedLength
+            expectedUnpackedLength: expectedUnpackedLength,
+            onChunkDecoded: onChunkDecoded
         )
         return FetchedXorb(
             data: decoded.data,
@@ -643,13 +689,15 @@ public final class XetDownloader: @unchecked Sendable {
     private func decodeXorbStream(
         stream: AsyncThrowingStream<ByteBuffer, Error>,
         bufferSemaphore: AsyncSemaphore,
-        expectedUnpackedLength: Int?
+        expectedUnpackedLength: Int?,
+        onChunkDecoded: (@Sendable (Int) -> Void)? = nil
     ) async throws -> (data: Data, chunkByteIndices: [Int]) {
         if let expectedUnpackedLength, expectedUnpackedLength > 0 {
             return try await decodeXorbStreamPreallocated(
                 stream: stream,
                 bufferSemaphore: bufferSemaphore,
-                totalOutputSize: expectedUnpackedLength
+                totalOutputSize: expectedUnpackedLength,
+                onChunkDecoded: onChunkDecoded
             )
         }
 
@@ -662,6 +710,7 @@ public final class XetDownloader: @unchecked Sendable {
                 if let uncompressed = try Xorb.decodeNextChunk(from: &cursor) {
                     data.append(uncompressed)
                     chunkByteIndices.append(data.count)
+                    onChunkDecoded?(uncompressed.count)
                     continue
                 }
                 if isEOF {
@@ -691,7 +740,8 @@ public final class XetDownloader: @unchecked Sendable {
     private func decodeXorbStreamPreallocated(
         stream: AsyncThrowingStream<ByteBuffer, Error>,
         bufferSemaphore: AsyncSemaphore,
-        totalOutputSize: Int
+        totalOutputSize: Int,
+        onChunkDecoded: (@Sendable (Int) -> Void)? = nil
     ) async throws -> (data: Data, chunkByteIndices: [Int]) {
         let outputBuffer = UnsafeMutableRawPointer.allocate(
             byteCount: totalOutputSize,
@@ -771,6 +821,7 @@ public final class XetDownloader: @unchecked Sendable {
                     cursor.consume(count: header.compressedLength)
                     writeOffset += header.uncompressedLength
                     chunkByteIndices.append(writeOffset)
+                    onChunkDecoded?(header.uncompressedLength)
                 }
             }
 

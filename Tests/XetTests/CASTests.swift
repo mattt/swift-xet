@@ -220,4 +220,64 @@ struct CASTests {
         #expect(term.range.lowerBound == 5)
         #expect(term.range.upperBound == 5)
     }
+
+    // MARK: - expectedTotalBytes (progress reporting)
+
+    @Test func expectedTotalBytesSumsUnpackedLengthsForFullFileDownload() throws {
+        let terms = [
+            ReconstructionResponse.Term(hash: "a", unpackedLength: 1000, range: 0 ..< 2),
+            ReconstructionResponse.Term(hash: "b", unpackedLength: 2500, range: 0 ..< 3),
+        ]
+
+        let reconstruction = ReconstructionResponse.init(offsetIntoFirstRange: 0, terms: terms, fetchInfo: [:])
+        
+        let total = reconstruction.expectedTotalBytes(byteRange: nil)
+
+        #expect(total == 3500)
+    }
+
+    @Test func expectedTotalBytesSubtractsOffsetIntoFirstRange() throws {
+        let terms = [
+            ReconstructionResponse.Term(hash: "a", unpackedLength: 1000, range: 0 ..< 2)
+        ]
+        
+        let reconstruction = ReconstructionResponse.init(offsetIntoFirstRange: 200, terms: terms, fetchInfo: [:])
+
+        let total = reconstruction.expectedTotalBytes(byteRange: nil)
+
+        #expect(total == 800)
+    }
+
+    @Test func expectedTotalBytesClampsToRequestedByteRange() throws {
+        let terms = [
+            ReconstructionResponse.Term(hash: "a", unpackedLength: 10_000, range: 0 ..< 20)
+        ]
+        
+        let reconstruction = ReconstructionResponse.init(offsetIntoFirstRange: 0, terms: terms, fetchInfo: [:])
+
+        let total = reconstruction.expectedTotalBytes(byteRange: 0..<512)
+
+        #expect(total == 512)
+    }
+
+    @Test func expectedTotalBytesNeverGoesNegative() throws {
+        let terms = [
+            ReconstructionResponse.Term(hash: "a", unpackedLength: 100, range: 0 ..< 1)
+        ]
+
+        // Offset larger than total unpacked bytes.
+        let reconstruction = ReconstructionResponse.init(offsetIntoFirstRange: 1000, terms: terms, fetchInfo: [:])
+
+        let total = reconstruction.expectedTotalBytes(byteRange: nil)
+
+        #expect(total == 0)
+    }
+
+    @Test func expectedTotalBytesForEmptyTerms() throws {
+        let reconstruction = ReconstructionResponse.init(offsetIntoFirstRange: 0, terms: [], fetchInfo: [:])
+
+        let total = reconstruction.expectedTotalBytes(byteRange: nil)
+
+        #expect(total == 0)
+    }
 }

@@ -238,6 +238,17 @@ struct CASClient: Sendable {
                 try urlRangeContainer.encode(urlRange.upperBound, forKey: .end)
             }
         }
+        
+        /// Computes the total number of output bytes expected for a reconstruction,  given an optional byte range restriction.
+        func expectedTotalBytes(byteRange: Range<UInt64>?) -> Int64 {
+            let totalUnpacked: Int64 = terms.reduce(Int64(0)) { $0 + Int64($1.unpackedLength) }
+
+            let afterOffset = Swift.max(Int64(0), totalUnpacked - Int64(offsetIntoFirstRange))
+            if let byteRange {
+                return Swift.min(afterOffset, Int64(byteRange.count))
+            }
+            return afterOffset
+        }
     }
 }
 
